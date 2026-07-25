@@ -21,7 +21,7 @@ from mcp.server.fastmcp import FastMCP
 
 from datetime import datetime, timedelta
 
-from odoo_mcp import files
+from odoo_mcp import files, presentation
 from odoo_mcp.journal import Journal, rendre_html, rendre_markdown
 from odoo_mcp.odoo_client import OdooClient, OdooError, ReadOnlyError, mask
 
@@ -631,6 +631,82 @@ def odoo_journal_report(path: str = "", format: str = "html",
                "sans_motif": f"{synthese['sans_motif']} opération(s) sans justification "
                              "— pense à ouvrir une étape (odoo_journal_chapter) avant "
                              "d'écrire." if synthese["sans_motif"] else ""})
+
+
+@mcp.tool()
+def odoo_presentation_guide(path: str = "", format: str = "html",
+                            journal_path: str = "") -> str:
+    """Générer le déroulé à suivre pour présenter le travail au client, écran par écran.
+
+    Se fonde sur ce qui a réellement été fait : le guide ne contient que les étapes
+    correspondant aux données mises en place. Pour chaque étape il donne le chemin de
+    menu exact dans Odoo, les clics à faire sous forme de cases à cocher, les
+    enregistrements précis à ouvrir, et une phrase d'accroche à dire au client.
+
+    Pensé pour être ouvert pendant la réunion : on coche au fur et à mesure, on ne
+    saute pas d'étape, et on garde le fil du discours.
+    """
+    if journal_path:
+        chemin = Path(journal_path).expanduser()
+        session, entrees = Journal.charger(chemin)
+        temporaire = Journal.__new__(Journal)
+        temporaire.entrees = entrees
+        synthese = Journal.synthese(temporaire)
+    else:
+        jr = _journal()
+        chemin = jr.path
+        session = {"titre": jr.titre, "objectif": jr.objectif, "base": jr.base,
+                   "utilisateur": jr.utilisateur,
+                   "ts": jr.debut.isoformat(timespec="seconds")}
+        entrees, synthese = jr.entrees, jr.synthese()
+
+    # Quels objets ont été touchés, et sous quels noms — pour pouvoir les retrouver en démo.
+    models: set[str] = set()
+    exemples: dict[str, list[str]] = {}
+    for e in entrees:
+        if e.get("type") != "operation" or e.get("methode") == "unlink":
+            continue
+        models.add(e["model"])
+        noms = [str(a.get("display_name")) for a in (e.get("avant") or [])
+                if a.get("display_name")]
+        if not noms and isinstance(e.get("apres"), dict):
+            valeur = e["apres"].get("name") or e["apres"].get("display_name")
+            if valeur:
+                noms = [str(valeur)]
+        if noms:
+            exemples.setdefault(e["model"], []).extend(noms)
+
+    guide = presentation.construire(models, session, exemples)
+    if not guide:
+        raise OdooError("Rien à présenter : aucune création ou modification enregistrée "
+                        "dans ce journal.")
+
+    base_out = Path(path).expanduser() if path else chemin.with_name(
+        chemin.stem + "_presentation")
+    if base_out.is_dir():
+        base_out = base_out / (chemin.stem + "_presentation")
+    base_out.parent.mkdir(parents=True, exist_ok=True)
+
+    produits = []
+    if format in ("html", "both"):
+        p = base_out.with_suffix(".html")
+        p.write_text(presentation.rendre_html(session, guide, synthese), encoding="utf-8")
+        produits.append(str(p))
+    if format in ("markdown", "md", "both"):
+        p = base_out.with_suffix(".md")
+        p.write_text(presentation.rendre_markdown(session, guide, synthese),
+                     encoding="utf-8")
+        produits.append(str(p))
+    if not produits:
+        raise OdooError(f"Format inconnu : {format!r} (attendu html, markdown ou both)")
+
+    return _j({
+        "guides": produits,
+        "etapes": [{"n": i, "titre": e["titre"], "ou": e["chemin"]}
+                   for i, e in enumerate(guide, 1)],
+        "conseil": "Ouvre le fichier HTML pendant la réunion : les cases à cocher "
+                   "permettent de suivre le déroulé sans rien oublier.",
+    })
 
 
 @mcp.tool()

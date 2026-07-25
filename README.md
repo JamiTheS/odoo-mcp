@@ -81,7 +81,7 @@ de test) :
 }
 ```
 
-## Les 24 outils
+## Les 25 outils
 
 ### Connexion
 
@@ -130,6 +130,7 @@ de test) :
 | `odoo_journal_chapter` | Ouvrir une étape de travail et sa justification métier |
 | `odoo_journal_note` | Consigner une décision, une observation, une alerte |
 | `odoo_journal_report` | Générer le rapport d'intervention (HTML et/ou Markdown) |
+| `odoo_presentation_guide` | Générer le déroulé de démonstration à suivre en réunion client |
 | `odoo_recent_changes` | Ce qui a bougé récemment, d'après l'audit natif d'Odoo |
 
 ## Le rapport d'intervention
@@ -149,9 +150,40 @@ odoo_journal_report(format="both")
 ```
 
 Le rapport HTML est autonome (aucune ressource externe), présentable tel quel ou imprimable
-en PDF. Il contient la synthèse chiffrée, les volumes par modèle, le déroulé chronologique
-par étape, et pour chaque modification le détail `avant → après`. Les suppressions y
-apparaissent avec **le nom de ce qui a disparu** et un marquage « irréversible ».
+en PDF. Il contient la synthèse chiffrée, les volumes par type d'information, le déroulé
+chronologique par étape, et pour chaque modification le détail `avant → après`. Les
+suppressions y apparaissent avec **le nom de ce qui a disparu** et un marquage
+« irréversible ».
+
+**Le rapport parle français, pas Odoo.** Les noms techniques sont traduits en langage
+courant — `res.partner` devient « Contacts (clients, fournisseurs) », `sale.order` devient
+« Devis et commandes clients » — et chaque type d'information est accompagné de l'endroit où
+le trouver dans l'interface. Un dirigeant qui n'a jamais ouvert Odoo comprend le document.
+
+## Le guide de présentation
+
+`odoo_presentation_guide` produit le **déroulé à suivre en réunion client**, écran par écran,
+déduit de ce qui a réellement été fait : seules les étapes correspondant aux données mises
+en place apparaissent, dans l'ordre naturel du métier (contacts → catalogue → devis →
+livraison → facture → rentabilité).
+
+Chaque étape donne le chemin de menu exact, les clics à faire sous forme de **cases à
+cocher**, les enregistrements précis à ouvrir, et une phrase d'accroche à dire au client.
+Le fichier HTML s'ouvre pendant la réunion : on coche au fur et à mesure, on n'oublie
+aucune étape, et on garde le fil du discours.
+
+```
+### Étape 3 — Du devis à la commande client
+
+Où aller : Ventes → Commandes → Devis
+
+[ ] Ouvrir un devis de la démonstration
+[ ] Montrer les lignes : articles, quantités, prix
+[ ] Expliquer le bouton « Confirmer » : le devis devient une commande ferme
+
+> À dire : C'est le point de bascule — un clic sur « Confirmer », et le reste
+  de la chaîne se met en route tout seul.
+```
 
 Les journaux sont écrits en JSONL dans `~/odoo-mcp-journaux/` (une ligne par opération,
 lisible et diffable), et un rapport peut être regénéré plus tard à partir d'un journal

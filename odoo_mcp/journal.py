@@ -16,19 +16,7 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 
-# Ce qu'une opération change, en langage métier.
-LIBELLE_OPERATION = {
-    "create": "Création",
-    "write": "Modification",
-    "unlink": "Suppression",
-    "load": "Import",
-    "action_confirm": "Confirmation",
-    "button_confirm": "Confirmation",
-    "action_post": "Comptabilisation",
-    "button_validate": "Validation",
-    "action_cancel": "Annulation",
-    "toggle_active": "Archivage / désarchivage",
-}
+from odoo_mcp import lexique
 
 IRREVERSIBLES = {"unlink"}
 
@@ -84,8 +72,9 @@ class Journal:
             "ts": _now(),
             "chapitre": self.chapitre,
             "model": model,
+            "objet": lexique.nom_metier(model),
             "methode": methode,
-            "operation": LIBELLE_OPERATION.get(methode, methode),
+            "operation": lexique.operation(methode),
             "nb": nb,
             "ids": (ids or [])[:200],
             "avant": (avant or [])[:20],
@@ -176,6 +165,17 @@ def rendre_markdown(session: dict, entrees: list[dict], synthese: dict) -> str:
                  "opérations irréversibles.")
         L.append("")
 
+    if synthese.get("par_model"):
+        L.append("### Par type d'information")
+        L.append("")
+        L.append("| Ce qui a été touché | Détail | Total |")
+        L.append("|---|---|---|")
+        for model, ops in sorted(synthese["par_model"].items(),
+                                 key=lambda kv: -sum(kv[1].values())):
+            detail = ", ".join(f"{op.lower()} : {n}" for op, n in sorted(ops.items()))
+            L.append(f"| {lexique.nom_metier(model)} | {detail} | {sum(ops.values())} |")
+        L.append("")
+
     L.append("## Déroulé")
     L.append("")
     for e in entrees:
@@ -189,8 +189,9 @@ def rendre_markdown(session: dict, entrees: list[dict], synthese: dict) -> str:
         elif e["type"] == "operation":
             motif = f" — {e['motif']}" if e.get("motif") else ""
             marque = " **(irréversible)**" if e["irreversible"] else ""
-            L.append(f"- `{_heure(e['ts'])}` **{e['operation']}** de {e['nb']} "
-                     f"`{e['model']}`{marque}{motif}")
+            objet = e.get("objet") or lexique.nom_metier(e["model"])
+            L.append(f"- `{_heure(e['ts'])}` **{e['operation']}** de {e['nb']} — "
+                     f"{objet}{marque}{motif}")
             if e["methode"] == "unlink":
                 for nom in _noms_supprimes(e):
                     L.append(f"  - supprimé : {nom}")
@@ -249,6 +250,7 @@ def rendre_html(session: dict, entrees: list[dict], synthese: dict) -> str:
  td{{padding:7px 10px;border-bottom:1px solid #e6ebef}}
  tbody tr:nth-child(even){{background:#fafbfc}}
  .why{{color:{GREY};font-style:italic;margin:2px 0 12px}}
+ .ou{{color:{GREY};font-size:12px;font-weight:400;margin-top:2px}}
  .op{{border-left:3px solid #dde3e8;padding:8px 0 8px 14px;margin:8px 0}}
  .op.irr{{border-left-color:#b3402f}}
  .op .h{{font-size:14px}}
@@ -289,13 +291,16 @@ def rendre_html(session: dict, entrees: list[dict], synthese: dict) -> str:
     parts.append("</div>")
 
     if synthese["par_model"]:
-        parts.append("<table><thead><tr><th>Modèle Odoo</th><th>Détail</th>"
+        parts.append("<table><thead><tr><th>Ce qui a été touché</th><th>Détail</th>"
                      "<th style='text-align:right'>Total</th></tr></thead><tbody>")
         for model, ops in sorted(synthese["par_model"].items(),
                                  key=lambda kv: -sum(kv[1].values())):
             detail = ", ".join(f"{op.lower()} : {n}" for op, n in sorted(ops.items()))
-            parts.append(f"<tr><td><code>{escape(model)}</code></td><td>{escape(detail)}</td>"
-                         f"<td style='text-align:right'><b>{sum(ops.values())}</b></td></tr>")
+            parts.append(
+                f"<tr><td><b>{escape(lexique.nom_metier(model))}</b>"
+                f"<div class='ou'>{escape(lexique.chemin(model))}</div></td>"
+                f"<td>{escape(detail)}</td>"
+                f"<td style='text-align:right'><b>{sum(ops.values())}</b></td></tr>")
         parts.append("</tbody></table>")
 
     if synthese["irreversibles"]:
@@ -314,9 +319,10 @@ def rendre_html(session: dict, entrees: list[dict], synthese: dict) -> str:
         elif e["type"] == "operation":
             cls = " irr" if e["irreversible"] else ""
             tag = '<span class="tag irr">IRRÉVERSIBLE</span>' if e["irreversible"] else ""
+            objet = e.get("objet") or lexique.nom_metier(e["model"])
             parts.append(f'<div class="op{cls}"><div class="h"><span class="t">'
                          f'{_heure(e["ts"])}</span>{tag}<b>{escape(e["operation"])}</b> '
-                         f'de {e["nb"]} <code>{escape(e["model"])}</code></div>')
+                         f'de {e["nb"]} — {escape(objet)}</div>')
             if e.get("motif"):
                 parts.append(f'<div class="motif">{escape(e["motif"])}</div>')
             if e["methode"] == "unlink":
