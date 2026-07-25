@@ -157,22 +157,27 @@ class OdooClient:
                                           "readonly", "store", "selection"]},
         )
 
-    def aggregate(self, model, domain, groupby: str, measure: str | None = None):
-        """Agrégation côté client.
+    def aggregate(self, model, domain, groupby: str, measures: list[str] | None = None,
+                  limit: int = 20000):
+        """Agrégation côté client : compte et somme(s) par valeur de `groupby`.
 
         `read_group` n'est plus exposé en RPC depuis Odoo 18/19 : on agrège ici.
+
+        `groupby` accepte une granularité sur les champs date : 'date_order:month'
+        (aussi day, week, quarter, year) — indispensable pour un CA par mois.
         """
-        fields = [groupby] + ([measure] if measure else [])
-        rows = self.execute_kw(model, "search_read", [domain or [], fields], {"limit": 20000})
+        measures = [m for m in (measures or []) if m]
+        field, _, granularity = groupby.partition(":")
+        rows = self.execute_kw(model, "search_read",
+                               [domain or [], [field] + measures], {"limit": limit})
         out: dict[str, dict[str, float]] = {}
         for r in rows:
-            v = r.get(groupby)
-            key = v[1] if isinstance(v, (list, tuple)) and len(v) == 2 else str(v)
-            slot = out.setdefault(key, {"count": 0, "sum": 0.0})
+            key = _group_key(r.get(field), granularity)
+            slot = out.setdefault(key, {"count": 0})
             slot["count"] += 1
-            if measure:
-                slot["sum"] += r.get(measure) or 0
-        return out
+            for m in measures:
+                slot[m] = slot.get(m, 0.0) + (r.get(m) or 0)
+        return dict(sorted(out.items()))
 
     # -- écriture
     def create(self, model, values: dict | list[dict]):
@@ -230,6 +235,34 @@ class OdooClient:
 
 
 # ------------------------------------------------------------------ utilitaires
+def _group_key(value, granularity: str = "") -> str:
+    """Clé de regroupement lisible : many2one -> libellé, date -> période demandée."""
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return str(value[1])
+    if value is False or value is None:
+        return "(vide)"
+    text = str(value)
+    if not granularity:
+        return text
+    # Les dates Odoo arrivent en 'YYYY-MM-DD' ou 'YYYY-MM-DD HH:MM:SS'.
+    date_part = text[:10]
+    try:
+        y, m, d = (int(x) for x in date_part.split("-"))
+    except ValueError:
+        return text
+    if granularity == "year":
+        return f"{y}"
+    if granularity == "quarter":
+        return f"{y}-T{(m - 1) // 3 + 1}"
+    if granularity == "month":
+        return f"{y}-{m:02d}"
+    if granularity == "week":
+        import datetime
+        iso = datetime.date(y, m, d).isocalendar()
+        return f"{iso[0]}-S{iso[1]:02d}"
+    return date_part
+
+
 def _short_fault(text: str) -> str:
     """Les traces Odoo font 50 lignes ; on garde la cause utile."""
     lines = [ln for ln in text.strip().splitlines() if ln.strip()]

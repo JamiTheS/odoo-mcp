@@ -12,11 +12,14 @@ L'écriture est bloquée par défaut ; elle s'active par l'outil `odoo_enable_wr
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from odoo_mcp import files
 from odoo_mcp.odoo_client import OdooClient, OdooError, ReadOnlyError, mask
 
 mcp = FastMCP("odoo")
@@ -174,14 +177,31 @@ def odoo_read(model: str, ids: str, fields: str = "[]") -> str:
 
 
 @mcp.tool()
-def odoo_aggregate(model: str, groupby: str, domain: str = "[]", measure: str = "") -> str:
-    """Agréger : nombre (et somme d'un champ `measure`) par valeur de `groupby`.
+def odoo_aggregate(model: str, groupby: str, domain: str = "[]", measures: str = "") -> str:
+    """Agréger : nombre et somme(s) par valeur de `groupby`.
 
     Remplace read_group, qui n'est plus exposé en RPC depuis Odoo 18.
-    Ex. : groupby='partner_id', measure='amount_total' sur sale.order.
+    `measures` est une liste JSON de champs à sommer, ex. '["amount_untaxed","amount_total"]'.
+    `groupby` accepte une granularité sur les dates — 'date_order:month' (aussi day, week,
+    quarter, year) : c'est ainsi qu'on obtient un chiffre d'affaires par mois.
     """
     c = _get_client()
-    return _j(c.aggregate(model, _parse(domain, []), groupby, measure or None))
+    parsed = _parse(measures, [])
+    if isinstance(parsed, str):
+        parsed = [parsed]
+    return _j(c.aggregate(model, _parse(domain, []), groupby, parsed))
+
+
+@mcp.tool()
+def odoo_name_find(model: str, name: str, limit: int = 10) -> str:
+    """Retrouver des enregistrements par leur nom, comme le ferait l'autocomplétion Odoo.
+
+    Le plus rapide pour convertir « le client Polytec » en identifiant avant d'écrire.
+    Cherche aussi sur les champs alternatifs du modèle (référence, code...).
+    """
+    c = _get_client()
+    found = c.execute_kw(model, "name_search", [name], {"limit": limit})
+    return _j([{"id": i, "nom": n} for i, n in found])
 
 
 # -------------------------------------------------------------------- écriture
@@ -210,16 +230,25 @@ def odoo_write(model: str, ids: str, values: str) -> str:
 
 
 @mcp.tool()
-def odoo_unlink(model: str, ids: str) -> str:
-    """Supprimer définitivement des enregistrements. IRRÉVERSIBLE.
+def odoo_unlink(model: str, ids: str, confirm_bulk: bool = False) -> str:
+    """Supprimer définitivement des enregistrements. IRRÉVERSIBLE — aucune corbeille.
 
-    Bloqué tant que odoo_enable_write n'a pas été appelé. Compter et montrer
-    ce qui va être supprimé avant d'appeler cet outil.
+    Bloqué tant que odoo_enable_write n'a pas été appelé. Au-delà de 50 enregistrements,
+    exige `confirm_bulk` : montre d'abord à l'utilisateur ce qui va disparaître.
+    Souvent, archiver (`odoo_write` avec {"active": false}) est préférable à supprimer.
     """
     c = _get_client()
     _require_write(c)
-    ok = c.unlink(model, _parse(ids, []))
-    return _j({"model": model, "ids": _parse(ids, []), "deleted": ok})
+    id_list = _parse(ids, [])
+    if len(id_list) > 50 and not confirm_bulk:
+        noms = c.read(model, id_list[:5], ["display_name"])
+        raise OdooError(
+            f"{len(id_list)} suppressions demandées sur {model}. Montre cet échantillon "
+            f"à l'utilisateur — {[n.get('display_name') for n in noms]} — obtiens son "
+            "accord, puis rappelle avec confirm_bulk=true."
+        )
+    ok = c.unlink(model, id_list)
+    return _j({"model": model, "supprimes": len(id_list), "deleted": ok})
 
 
 @mcp.tool()
@@ -245,6 +274,218 @@ def odoo_execute(model: str, method: str, args: str = "[]", kwargs: str = "{}") 
     """
     c = _get_client()
     return _j(c.execute_kw(model, method, _parse(args, []), _parse(kwargs, {})))
+
+
+@mcp.tool()
+def odoo_update_where(model: str, domain: str, values: str, confirm: bool = False,
+                      max_records: int = 500) -> str:
+    """Modifier en masse tous les enregistrements correspondant à un domaine.
+
+    Sans `confirm`, ne modifie RIEN : renvoie le nombre d'enregistrements concernés et
+    un échantillon avant/après. Montre ce résultat à l'utilisateur, obtiens son accord,
+    puis rappelle avec confirm=True. C'est le garde-fou qui évite d'écraser 800 fiches
+    sur un domaine mal écrit.
+    """
+    c = _get_client()
+    dom = _parse(domain, [])
+    vals = _parse(values, {})
+    if not vals:
+        raise OdooError("`values` est vide : rien à modifier.")
+
+    ids = c.execute_kw(model, "search", [dom], {"limit": max_records + 1})
+    if len(ids) > max_records:
+        raise OdooError(
+            f"{len(ids)}+ enregistrements visés, au-delà de la limite de {max_records}. "
+            "Restreins le domaine, ou relance en augmentant max_records en connaissance "
+            "de cause."
+        )
+    if not ids:
+        return _j({"model": model, "concernes": 0, "message": "Aucun enregistrement."})
+
+    champs = sorted(vals)
+    avant = c.read(model, ids[:5], ["display_name"] + champs)
+    apercu = [{"id": r["id"], "nom": r.get("display_name"),
+               "avant": {k: files.flatten(r.get(k)) for k in champs},
+               "apres": vals} for r in avant]
+
+    if not confirm:
+        return _j({
+            "mode": "PREVISUALISATION - rien n'a ete modifie",
+            "model": model, "concernes": len(ids), "modifications": vals,
+            "apercu": apercu,
+            "suite": "Fais valider ces changements par l'utilisateur, puis rappelle "
+                     "odoo_update_where avec confirm=true.",
+        })
+
+    _require_write(c)
+    c.write(model, ids, vals)
+    return _j({"model": model, "modifies": len(ids), "modifications": vals})
+
+
+@mcp.tool()
+def odoo_import_file(path: str, mode: str = "inspect", model: str = "",
+                     mapping: str = "{}", sheet: str = "", header_row: int = 1,
+                     batch_size: int = 200) -> str:
+    """Importer un fichier Excel/CSV local vers Odoo, en trois temps.
+
+    Le serveur tourne sur la machine de l'utilisateur : il lit le fichier directement,
+    sans le faire transiter par la conversation — c'est ce qui rend possible un import
+    de plusieurs milliers de lignes.
+
+    Modes, à enchaîner dans cet ordre :
+      - 'inspect' : structure du fichier (colonnes, remplissage, valeurs distinctes,
+        doublons d'identifiant). Aucune connexion requise.
+      - 'check'   : construit les lignes et vérifie les champs contre le modèle,
+        sans rien écrire.
+      - 'run'     : importe réellement, par lots, via load() — l'import natif d'Odoo.
+
+    `mapping` est un objet JSON reliant les colonnes du fichier aux champs Odoo. Les
+    en-têtes des fichiers exportés d'Odoo sont des libellés d'interface ('Name*',
+    'Sales Price'), jamais des noms de champs : ce mapping fait la traduction.
+
+        {"_model": "res.partner",
+         "_columns": {"Code": "id", "Nom": "name", "Pays": "country_id/id",
+                      "Notes": null},
+         "_constants": {"is_company": "True"},
+         "_replace": {"type": {"Goods": "consu"}}}
+
+    Mapper une colonne sur 'id' (External ID) rend l'import rejouable : une seconde
+    exécution met à jour au lieu de dupliquer. load() rejette un lot entier en cas
+    d'erreur, donc un échec ne laisse jamais de données à moitié écrites.
+    """
+    file_path = Path(path).expanduser()
+    if not file_path.exists():
+        raise OdooError(f"Fichier introuvable : {file_path}")
+    header, rows = files.read_rows(file_path, sheet, header_row)
+
+    if mode == "inspect":
+        return _j({"fichier": file_path.name, **files.inspect_summary(header, rows)})
+
+    m = _parse(mapping, {})
+    target = model or m.get("_model")
+    if not target:
+        raise OdooError("Précise `model`, ou '_model' dans le mapping.")
+    fields, data = files.build(header, rows, m)
+    if not fields:
+        raise OdooError("Aucune colonne mappée : vérifie '_columns' au regard des "
+                        "en-têtes retournés par le mode 'inspect'.")
+
+    c = _get_client()
+    connus = c.fields_get(target)
+    base = {f.split("/")[0] for f in fields if f != "id"}
+    inconnus = sorted(f for f in base if f not in connus)
+    lecture_seule = sorted(f for f in base
+                           if connus.get(f, {}).get("readonly")
+                           and connus.get(f, {}).get("store") is not False)
+
+    rapport = {
+        "fichier": file_path.name, "model": target,
+        "lignes": len(data), "champs": fields,
+        "champs_inconnus": inconnus,
+        "champs_lecture_seule": lecture_seule,
+        "apercu": [dict(zip(fields, row)) for row in data[:3]],
+    }
+
+    if mode == "check":
+        rapport["verdict"] = ("Des champs sont invalides : corrige le mapping."
+                              if inconnus else "Prêt à importer (mode 'run').")
+        return _j(rapport)
+
+    if mode != "run":
+        raise OdooError(f"Mode inconnu : {mode!r} (attendu inspect, check ou run)")
+    if inconnus:
+        raise OdooError(f"Champs inconnus sur {target} : {', '.join(inconnus)}. "
+                        "Lance le mode 'check' et corrige le mapping.")
+
+    _require_write(c)
+    importes = 0
+    for start in range(0, len(data), batch_size):
+        chunk = data[start:start + batch_size]
+        try:
+            res = c.load(target, fields, chunk)
+        except OdooError as exc:
+            raise OdooError(
+                f"Échec sur le lot {start}-{start + len(chunk)} après {importes} lignes "
+                f"importées. Ce lot n'a rien écrit (load() est atomique).\n{exc}"
+            ) from exc
+        importes += len(res.get("ids") or [])
+    rapport["importes"] = importes
+    rapport["verdict"] = "Import terminé."
+    return _j(rapport)
+
+
+@mcp.tool()
+def odoo_export_file(model: str, path: str, domain: str = "[]", fields: str = "[]",
+                     limit: int = 10000, order: str = "") -> str:
+    """Exporter le résultat d'une recherche vers un fichier .xlsx ou .csv local.
+
+    Le fichier est écrit directement sur la machine de l'utilisateur. Les relations
+    sont aplaties pour rester lisibles : un many2one devient son libellé.
+    Sans `fields`, exporte les champs stockés les plus courants du modèle.
+    """
+    c = _get_client()
+    out_path = Path(path).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cols = _parse(fields, [])
+    if not cols:
+        meta = c.fields_get(model)
+        cols = [f for f in ("display_name", "name", "default_code", "partner_id", "date",
+                            "date_order", "state", "amount_untaxed", "amount_total",
+                            "email", "phone", "city", "country_id")
+                if f in meta]
+        if not cols:
+            cols = ["display_name"]
+
+    rows = c.search_read(model, _parse(domain, []), cols,
+                         limit=limit, order=order or None)
+    table = [[files.flatten(r.get(col)) for col in cols] for r in rows]
+    files.write_table(out_path, cols, table)
+    return _j({"fichier": str(out_path), "model": model,
+               "lignes": len(rows), "colonnes": cols})
+
+
+@mcp.tool()
+def odoo_get_attachment(attachment_id: int, path: str = "") -> str:
+    """Télécharger une pièce jointe Odoo (ir.attachment) sur le disque local.
+
+    Utile pour récupérer un PDF de facture, un document lié à une affaire, une image.
+    Pour retrouver l'identifiant : odoo_search sur ir.attachment avec un domaine du type
+    '[["res_model","=","account.move"],["res_id","=",42]]'.
+    Sans `path`, le fichier est écrit dans le dossier courant sous son nom d'origine.
+    """
+    c = _get_client()
+    meta = c.read("ir.attachment", [attachment_id], ["name", "mimetype"])
+    if not meta:
+        raise OdooError(f"Pièce jointe {attachment_id} introuvable.")
+    meta = meta[0]
+
+    # Le champ du contenu a changé de nom : 'raw' depuis Odoo 16, 'datas' avant.
+    contenu = None
+    for champ in ("raw", "datas"):
+        try:
+            rec = c.read("ir.attachment", [attachment_id], [champ])
+        except OdooError:
+            continue
+        contenu = rec[0].get(champ)
+        if contenu:
+            break
+    if not contenu:
+        raise OdooError(
+            f"La pièce jointe '{meta['name']}' n'a pas de contenu lisible "
+            "(lien externe, ou stockage inaccessible via XML-RPC)."
+        )
+
+    brut = contenu.data if hasattr(contenu, "data") else contenu
+    octets = base64.b64decode(brut) if isinstance(brut, str) else bytes(brut)
+
+    out_path = Path(path).expanduser() if path else Path.cwd() / meta["name"]
+    if out_path.is_dir():
+        out_path = out_path / meta["name"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(octets)
+    return _j({"fichier": str(out_path), "nom": meta["name"],
+               "type": meta.get("mimetype"), "octets": out_path.stat().st_size})
 
 
 def main() -> None:
