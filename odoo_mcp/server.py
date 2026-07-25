@@ -19,8 +19,13 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from datetime import datetime, timedelta
+
 from odoo_mcp import files
+from odoo_mcp.journal import Journal, rendre_html, rendre_markdown
 from odoo_mcp.odoo_client import OdooClient, OdooError, ReadOnlyError, mask
+
+DOSSIER_JOURNAUX = Path.home() / "odoo-mcp-journaux"
 
 mcp = FastMCP("odoo")
 
@@ -99,13 +104,24 @@ def odoo_status() -> str:
     c = _get_client()
     uid = c.uid
     user = c.read("res.users", [uid], ["name", "login"])[0]
-    return _j({
+    etat = {
         "url": c.url, "db": c.db, "uid": uid,
         "user": user["name"], "login": user["login"],
         "api_key": mask(c.api_key),
         "server_version": c.version().get("server_version"),
         "mode": "lecture seule" if c.readonly else "LECTURE + ÉCRITURE",
-    })
+    }
+    if c.journal:
+        etat["journal"] = {
+            "fichier": str(c.journal.path),
+            "titre": c.journal.titre,
+            "chapitre_courant": c.journal.chapitre or "(aucun)",
+            **c.journal.synthese(),
+        }
+    else:
+        etat["journal"] = ("aucun — ouvre-en un avec odoo_journal_start pour tracer "
+                           "les écritures et pouvoir produire un rapport")
+    return _j(etat)
 
 
 @mcp.tool()
@@ -278,13 +294,16 @@ def odoo_execute(model: str, method: str, args: str = "[]", kwargs: str = "{}") 
 
 @mcp.tool()
 def odoo_update_where(model: str, domain: str, values: str, confirm: bool = False,
-                      max_records: int = 500) -> str:
+                      max_records: int = 500, motif: str = "") -> str:
     """Modifier en masse tous les enregistrements correspondant à un domaine.
 
     Sans `confirm`, ne modifie RIEN : renvoie le nombre d'enregistrements concernés et
     un échantillon avant/après. Montre ce résultat à l'utilisateur, obtiens son accord,
     puis rappelle avec confirm=True. C'est le garde-fou qui évite d'écraser 800 fiches
     sur un domaine mal écrit.
+
+    `motif` justifie la modification dans le rapport d'intervention — renseigne-le,
+    c'est ce que le client lira pour comprendre pourquoi ses données ont changé.
     """
     c = _get_client()
     dom = _parse(domain, [])
@@ -318,8 +337,15 @@ def odoo_update_where(model: str, domain: str, values: str, confirm: bool = Fals
         })
 
     _require_write(c)
-    c.write(model, ids, vals)
-    return _j({"model": model, "modifies": len(ids), "modifications": vals})
+    precedent = c.motif_courant
+    if motif:
+        c.motif_courant = motif
+    try:
+        c.write(model, ids, vals)
+    finally:
+        c.motif_courant = precedent
+    return _j({"model": model, "modifies": len(ids), "modifications": vals,
+               "motif": motif or precedent})
 
 
 @mcp.tool()
@@ -486,6 +512,158 @@ def odoo_get_attachment(attachment_id: int, path: str = "") -> str:
     out_path.write_bytes(octets)
     return _j({"fichier": str(out_path), "nom": meta["name"],
                "type": meta.get("mimetype"), "octets": out_path.stat().st_size})
+
+
+# --------------------------------------------------------------------- journal
+def _journal() -> Journal:
+    c = _get_client()
+    if c.journal is None:
+        raise OdooError(
+            "Aucun journal ouvert. Appelle odoo_journal_start(titre, objectif) au début "
+            "de la session : toutes les écritures seront alors tracées automatiquement, "
+            "avec leur état avant/après, et un rapport présentable pourra être généré."
+        )
+    return c.journal
+
+
+@mcp.tool()
+def odoo_journal_start(titre: str, objectif: str = "", path: str = "") -> str:
+    """Ouvrir un journal d'intervention. À faire AVANT toute écriture.
+
+    Une fois ouvert, chaque création, modification, suppression et import est enregistré
+    automatiquement — y compris l'état des enregistrements AVANT modification. C'est ce
+    qui permet de produire ensuite un rapport expliquant ce qui a changé et pourquoi,
+    sans avoir à retrouver l'information dans l'historique de la conversation.
+
+    `titre` nomme l'intervention (« Maquette Pycarelle », « Reprise du catalogue »),
+    `objectif` explique en une phrase ce qu'on cherche à obtenir : les deux figurent en
+    tête du rapport remis au client.
+    """
+    c = _get_client()
+    uid = c.uid
+    utilisateur = c.read("res.users", [uid], ["name"])[0]["name"]
+    if path:
+        chemin = Path(path).expanduser()
+    else:
+        horodatage = datetime.now().strftime("%Y%m%d-%H%M")
+        chemin = DOSSIER_JOURNAUX / f"{c.db}_{horodatage}.jsonl"
+    c.journal = Journal(chemin, base=c.db, utilisateur=utilisateur,
+                        titre=titre, objectif=objectif)
+    return _j({"journal": str(chemin), "titre": titre, "objectif": objectif,
+               "base": c.db, "utilisateur": utilisateur,
+               "suite": "Les écritures sont désormais tracées. Ouvre une étape avec "
+                        "odoo_journal_chapter avant chaque phase de travail."})
+
+
+@mcp.tool()
+def odoo_journal_chapter(nom: str, pourquoi: str = "") -> str:
+    """Ouvrir une étape de travail dans le journal.
+
+    Les opérations suivantes y sont rattachées, ce qui structure le rapport en phases
+    lisibles (« Création du référentiel articles », « Correction des adresses »).
+    `pourquoi` est la justification métier de l'étape : c'est elle qui répond à la
+    question « pourquoi cette modification ? » dans le rapport.
+    """
+    jr = _journal()
+    jr.ouvrir_chapitre(nom, pourquoi)
+    _get_client().motif_courant = pourquoi
+    return _j({"chapitre": nom, "pourquoi": pourquoi})
+
+
+@mcp.tool()
+def odoo_journal_note(texte: str, categorie: str = "note") -> str:
+    """Consigner une décision, une observation ou un point d'attention dans le journal.
+
+    À utiliser pour tout ce qui n'est pas une écriture mais mérite d'être expliqué au
+    client : un arbitrage, une anomalie constatée, une limite technique rencontrée,
+    un sujet laissé de côté. `categorie` peut valoir 'note', 'decision' ou 'alerte'.
+    """
+    jr = _journal()
+    jr.noter(texte, categorie)
+    return _j({"enregistre": texte, "categorie": categorie})
+
+
+@mcp.tool()
+def odoo_journal_report(path: str = "", format: str = "html",
+                        journal_path: str = "") -> str:
+    """Générer le rapport d'intervention : ce qui a été fait, et pourquoi.
+
+    Produit un document autonome, présentable tel quel au client : synthèse chiffrée,
+    volumes par modèle, déroulé chronologique par étape, et pour chaque modification
+    le détail avant → après.
+
+    `format` : 'html' (présentable, à ouvrir dans un navigateur ou imprimer en PDF),
+    'markdown' (à intégrer dans un compte rendu), ou 'both'.
+    `journal_path` permet de produire le rapport d'une session antérieure.
+    """
+    if journal_path:
+        chemin = Path(journal_path).expanduser()
+        session, entrees = Journal.charger(chemin)
+        temporaire = Journal.__new__(Journal)
+        temporaire.entrees = entrees
+        synthese = Journal.synthese(temporaire)
+    else:
+        jr = _journal()
+        chemin = jr.path
+        session = {"titre": jr.titre, "objectif": jr.objectif, "base": jr.base,
+                   "utilisateur": jr.utilisateur,
+                   "ts": jr.debut.isoformat(timespec="seconds")}
+        entrees, synthese = jr.entrees, jr.synthese()
+
+    base_out = Path(path).expanduser() if path else chemin.with_suffix("")
+    if base_out.is_dir():
+        base_out = base_out / chemin.stem
+    base_out.parent.mkdir(parents=True, exist_ok=True)
+
+    produits = []
+    if format in ("html", "both"):
+        p = base_out.with_suffix(".html")
+        p.write_text(rendre_html(session, entrees, synthese), encoding="utf-8")
+        produits.append(str(p))
+    if format in ("markdown", "md", "both"):
+        p = base_out.with_suffix(".md")
+        p.write_text(rendre_markdown(session, entrees, synthese), encoding="utf-8")
+        produits.append(str(p))
+    if not produits:
+        raise OdooError(f"Format inconnu : {format!r} (attendu html, markdown ou both)")
+
+    return _j({"rapports": produits, "journal": str(chemin), "synthese": synthese,
+               "sans_motif": f"{synthese['sans_motif']} opération(s) sans justification "
+                             "— pense à ouvrir une étape (odoo_journal_chapter) avant "
+                             "d'écrire." if synthese["sans_motif"] else ""})
+
+
+@mcp.tool()
+def odoo_recent_changes(model: str, jours: int = 7, limit: int = 50,
+                        domain: str = "[]") -> str:
+    """Lister ce qui a bougé récemment dans un modèle, d'après Odoo lui-même.
+
+    S'appuie sur les champs d'audit natifs (create_date, write_date, create_uid,
+    write_uid) : contrairement au journal du connecteur, cet outil voit AUSSI les
+    modifications faites directement dans l'interface Odoo par d'autres personnes.
+    Utile pour reprendre le fil d'un dossier ou vérifier ce qui a changé depuis
+    la dernière réunion.
+    """
+    c = _get_client()
+    depuis = (datetime.now() - timedelta(days=jours)).strftime("%Y-%m-%d %H:%M:%S")
+    dom = _parse(domain, []) + [["write_date", ">=", depuis]]
+    champs = [f for f in ("display_name", "create_date", "write_date",
+                          "create_uid", "write_uid")
+              if f in c.fields_get(model)]
+    recs = c.search_read(model, dom, champs, limit=limit, order="write_date desc")
+    lignes = []
+    for r in recs:
+        cree = str(r.get("create_date", ""))[:19]
+        modifie = str(r.get("write_date", ""))[:19]
+        lignes.append({
+            "id": r["id"],
+            "nom": r.get("display_name"),
+            "etat": "créé" if cree[:16] == modifie[:16] else "modifié",
+            "le": modifie,
+            "par": files.flatten(r.get("write_uid")),
+        })
+    return _j({"model": model, "depuis": depuis, "nb": len(lignes),
+               "changements": lignes})
 
 
 def main() -> None:

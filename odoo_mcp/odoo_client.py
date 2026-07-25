@@ -48,6 +48,8 @@ class OdooClient:
         self.api_key = api_key
         self.readonly = readonly
         self.timeout = timeout
+        self.journal = None          # objet Journal, posé par le serveur si activé
+        self.motif_courant = ""      # justification appliquée aux écritures suivantes
         self._uid: int | None = None
         self._models: xmlrpc.client.ServerProxy | None = None
 
@@ -128,12 +130,58 @@ class OdooClient:
             )
         uid = self.uid
         assert self._models is not None
+
+        # Capture de l'état AVANT : c'est ce qui permet de dire « X est passé de A à B »
+        # dans le rapport, et pas seulement « X a été modifié ».
+        avant = self._capturer_avant(model, method, args) if self.journal else None
+
         try:
-            return self._models.execute_kw(
+            resultat = self._models.execute_kw(
                 self.db, uid, self.api_key, model, method, args or [], kwargs or {}
             )
         except xmlrpc.client.Fault as exc:
             raise OdooError(f"{model}.{method} : {_short_fault(exc.faultString)}") from exc
+
+        if self.journal and method in WRITE_METHODS:
+            self._journaliser(model, method, args, resultat, avant)
+        return resultat
+
+    # -- journalisation
+    def _capturer_avant(self, model: str, method: str, args: list | None):
+        if method not in ("write", "unlink", "toggle_active") or not args:
+            return None
+        ids = args[0] if isinstance(args[0], list) else [args[0]]
+        if not ids or not all(isinstance(i, int) for i in ids):
+            return None
+        champs = ["display_name"]
+        if method == "write" and len(args) > 1 and isinstance(args[1], dict):
+            champs += [k for k in args[1] if not k.startswith("_")]
+        try:
+            return self.execute_kw(model, "read", [ids[:20], champs])
+        except OdooError:
+            return None   # un champ illisible ne doit jamais bloquer l'écriture
+
+    def _journaliser(self, model, method, args, resultat, avant) -> None:
+        ids, nb, apres = [], 1, None
+        if method == "create":
+            ids = resultat if isinstance(resultat, list) else [resultat]
+            nb = len(ids)
+            apres = args[0] if args else None
+        elif method in ("write", "toggle_active"):
+            ids = args[0] if args and isinstance(args[0], list) else []
+            nb = len(ids)
+            apres = args[1] if args and len(args) > 1 else None
+        elif method == "unlink":
+            ids = args[0] if args and isinstance(args[0], list) else []
+            nb = len(ids)
+        elif method == "load":
+            ids = (resultat or {}).get("ids") or []
+            nb = len(ids)
+        else:
+            ids = args[0] if args and isinstance(args[0], list) else []
+            nb = len(ids) or 1
+        self.journal.enregistrer(model, method, nb, ids=ids, avant=avant,
+                                 apres=apres, motif=self.motif_courant)
 
     # -- raccourcis de lecture
     def search_read(self, model, domain=None, fields=None, limit=None, order=None, offset=0):

@@ -15,6 +15,9 @@ Claude Desktop, Cursor...**
   directement — un catalogue de 1 500 lignes s'importe sans passer par la conversation.
 - **Écritures rejouables** : `odoo_upsert` et l'import par External ID mettent à jour au lieu
   de dupliquer.
+- **Tout est tracé** : chaque écriture est journalisée automatiquement avec son état
+  avant/après, et `odoo_journal_report` produit un rapport d'intervention présentable
+  au client — ce qui a été fait, et pourquoi.
 
 ## Installation
 
@@ -78,7 +81,7 @@ de test) :
 }
 ```
 
-## Les 19 outils
+## Les 24 outils
 
 ### Connexion
 
@@ -118,6 +121,45 @@ de test) :
 | `odoo_import_file` | Importer un .xlsx/.csv — modes `inspect`, `check`, `run` |
 | `odoo_export_file` | Exporter une recherche vers .xlsx ou .csv |
 | `odoo_get_attachment` | Télécharger une pièce jointe (PDF de facture, document...) |
+
+### Traçabilité et reporting
+
+| Outil | Rôle |
+|---|---|
+| `odoo_journal_start` | Ouvrir un journal d'intervention (titre + objectif) |
+| `odoo_journal_chapter` | Ouvrir une étape de travail et sa justification métier |
+| `odoo_journal_note` | Consigner une décision, une observation, une alerte |
+| `odoo_journal_report` | Générer le rapport d'intervention (HTML et/ou Markdown) |
+| `odoo_recent_changes` | Ce qui a bougé récemment, d'après l'audit natif d'Odoo |
+
+## Le rapport d'intervention
+
+Quand c'est l'assistant qui construit un flux entier, retrouver après coup ce qui a été fait
+— et l'expliquer à un client — devient vite impossible à partir du seul historique de
+conversation. Le serveur étant le point de passage obligé de toute écriture, il journalise
+tout automatiquement.
+
+```
+odoo_journal_start("Maquette Pycarelle", "Traduire le flux affaires dans Odoo")
+odoo_journal_chapter("Référentiel articles", "Aucun catalogue n'existait : prérequis
+                                              pour bloquer les achats hors contrat")
+   → les écritures suivantes sont tracées, avec leur état avant/après
+odoo_journal_note("Le stock client reste hors périmètre (décision du 22/07)", "decision")
+odoo_journal_report(format="both")
+```
+
+Le rapport HTML est autonome (aucune ressource externe), présentable tel quel ou imprimable
+en PDF. Il contient la synthèse chiffrée, les volumes par modèle, le déroulé chronologique
+par étape, et pour chaque modification le détail `avant → après`. Les suppressions y
+apparaissent avec **le nom de ce qui a disparu** et un marquage « irréversible ».
+
+Les journaux sont écrits en JSONL dans `~/odoo-mcp-journaux/` (une ligne par opération,
+lisible et diffable), et un rapport peut être regénéré plus tard à partir d'un journal
+ancien via `journal_path`.
+
+`odoo_recent_changes` complète le dispositif : il interroge les champs d'audit d'Odoo
+(`write_date`, `write_uid`), donc il voit aussi les modifications faites directement dans
+l'interface par d'autres personnes.
 
 ## Importer un fichier
 

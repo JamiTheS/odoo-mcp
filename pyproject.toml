@@ -1,7 +1,7 @@
 [project]
 name = "odoo-mcp"
-version = "1.1.0"
-description = "Serveur MCP pour piloter une base Odoo via XML-RPC : lecture, écriture gardée, import/export Excel, modification de masse avec prévisualisation. Aucun identifiant stocké."
+version = "1.2.0"
+description = "Serveur MCP pour piloter une base Odoo via XML-RPC : lecture, écriture gardée, import/export Excel, et journal d'audit avec rapport d'intervention. Aucun identifiant stocké."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Damien Dechamps" }]
