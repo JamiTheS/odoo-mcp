@@ -18,6 +18,8 @@ Claude Desktop, Cursor...**
 - **Tout est tracé** : chaque écriture est journalisée automatiquement avec son état
   avant/après, et `odoo_journal_report` produit un rapport d'intervention présentable
   au client — ce qui a été fait, et pourquoi.
+- **Tableaux de bord générés** : `odoo_dashboard_create` produit de vrais tableaux de bord
+  Odoo dont les graphiques sont recalculés en direct, pas des captures d'écran.
 
 ## Installation
 
@@ -81,7 +83,7 @@ de test) :
 }
 ```
 
-## Les 25 outils
+## Les 29 outils
 
 ### Connexion
 
@@ -121,6 +123,15 @@ de test) :
 | `odoo_import_file` | Importer un .xlsx/.csv — modes `inspect`, `check`, `run` |
 | `odoo_export_file` | Exporter une recherche vers .xlsx ou .csv |
 | `odoo_get_attachment` | Télécharger une pièce jointe (PDF de facture, document...) |
+
+### Tableaux de bord
+
+| Outil | Rôle |
+|---|---|
+| `odoo_dashboard_list` | Inventaire des tableaux de bord et de leurs rubriques |
+| `odoo_dashboard_inspect` | Décrire en clair le contenu d'un tableau de bord |
+| `odoo_dashboard_create` | Créer un tableau de bord de graphiques calculés en direct |
+| `odoo_saved_analysis` | Enregistrer une analyse réutilisable (« favori » Odoo) |
 
 ### Traçabilité et reporting
 
@@ -223,6 +234,36 @@ en-têtes des fichiers exportés depuis Odoo sont des libellés d'interface (`Na
 Mapper une colonne sur `id` (External ID) rend l'import **rejouable** : une seconde exécution
 met à jour au lieu de dupliquer. Et `load()` rejette un lot entier en cas d'erreur — un échec
 ne laisse jamais de données à moitié écrites.
+
+## Générer un tableau de bord
+
+Les graphiques produits sont **recalculés par Odoo à chaque ouverture** — ce ne sont ni
+des images ni des valeurs figées. Chacun porte sa source, son regroupement, sa mesure et
+son filtre :
+
+```json
+[
+  {"titre": "Chiffre d'affaires par mois", "model": "sale.order",
+   "groupby": ["date_order:month"], "mesure": "amount_untaxed",
+   "type": "line", "domaine": [["state","=","sale"]], "pleine_largeur": true},
+  {"titre": "Commandes par vendeur", "model": "sale.order",
+   "groupby": ["user_id"], "mesure": "__count", "type": "bar"}
+]
+```
+
+Trois types : `bar` (comparer), `line` (suivre dans le temps), `pie` (répartition). Sur
+un champ date, la granularité s'écrit `champ:month` — aussi `day`, `week`, `quarter`,
+`year`. `__count` compte au lieu de sommer.
+
+Le modèle, les champs de regroupement et le type de la mesure sont **vérifiés avant
+écriture**, et la vérification fonctionne en lecture seule : on peut valider une maquette
+avant de demander l'autorisation d'écrire. C'est important, car un tableau de bord qui
+référence un champ inexistant s'ouvre vide, sans message d'erreur.
+
+**[SPREADSHEETS.md](SPREADSHEETS.md) explique en détail** comment fonctionnent les
+tableurs Odoo : le format o-spreadsheet, les quatre façons de connecter des données et
+leur robustesse respective, le choix de la bonne source (`sale.report` plutôt que
+`sale.order`…), et ce que ce connecteur ne génère volontairement pas.
 
 ## Notes de terrain
 

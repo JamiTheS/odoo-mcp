@@ -21,7 +21,7 @@ from mcp.server.fastmcp import FastMCP
 
 from datetime import datetime, timedelta
 
-from odoo_mcp import files, presentation
+from odoo_mcp import dashboards, files, presentation
 from odoo_mcp.journal import Journal, rendre_html, rendre_markdown
 from odoo_mcp.odoo_client import OdooClient, OdooError, ReadOnlyError, mask
 
@@ -740,6 +740,180 @@ def odoo_recent_changes(model: str, jours: int = 7, limit: int = 50,
         })
     return _j({"model": model, "depuis": depuis, "nb": len(lignes),
                "changements": lignes})
+
+
+# ---------------------------------------------------- tableaux de bord Odoo
+@mcp.tool()
+def odoo_dashboard_list() -> str:
+    """Lister les tableaux de bord existants et leurs rubriques.
+
+    Utile pour savoir où ranger un nouveau tableau de bord, et pour repérer ceux
+    livrés par Odoo dont on peut s'inspirer (odoo_dashboard_inspect).
+    """
+    c = _get_client()
+    groupes = c.search_read("spreadsheet.dashboard.group", [], ["name", "sequence"],
+                            order="sequence")
+    tableaux = c.search_read("spreadsheet.dashboard", [],
+                             ["name", "dashboard_group_id", "sequence", "is_published"],
+                             order="sequence", limit=200)
+    par_groupe: dict[str, list] = {}
+    for t in tableaux:
+        g = t["dashboard_group_id"][1] if t["dashboard_group_id"] else "(sans rubrique)"
+        par_groupe.setdefault(g, []).append(
+            {"id": t["id"], "nom": t["name"], "publie": t["is_published"]})
+    return _j({
+        "rubriques": [{"id": g["id"], "nom": g["name"]} for g in groupes],
+        "tableaux_de_bord": par_groupe,
+        "ou_les_voir": "Menu « Tableaux de bord » dans Odoo",
+    })
+
+
+@mcp.tool()
+def odoo_dashboard_inspect(dashboard_id: int) -> str:
+    """Décrire le contenu d'un tableau de bord : graphiques, sources, filtres.
+
+    Traduit le JSON interne en description lisible. Pratique pour comprendre comment
+    un tableau de bord Odoo est construit avant d'en créer un semblable.
+    """
+    c = _get_client()
+    rec = c.read("spreadsheet.dashboard", [dashboard_id],
+                 ["name", "dashboard_group_id", "spreadsheet_binary_data"])
+    if not rec:
+        raise OdooError(f"Tableau de bord {dashboard_id} introuvable.")
+    rec = rec[0]
+    if not rec.get("spreadsheet_binary_data"):
+        raise OdooError(f"« {rec['name']} » n'a pas de contenu lisible.")
+    classeur = dashboards.decoder(rec["spreadsheet_binary_data"])
+    return _j({
+        "nom": rec["name"],
+        "rubrique": rec["dashboard_group_id"][1] if rec["dashboard_group_id"] else None,
+        **dashboards.resumer(classeur),
+    })
+
+
+@mcp.tool()
+def odoo_dashboard_create(nom: str, graphiques: str, rubrique: str = "",
+                          sous_titre: str = "", dashboard_id: int = 0) -> str:
+    """Créer (ou remplacer) un tableau de bord Odoo à partir d'une liste de graphiques.
+
+    Les graphiques sont **recalculés en direct par Odoo** à chaque ouverture : ce ne
+    sont pas des images ni des valeurs figées. Chacun porte sa source, son
+    regroupement, sa mesure et son filtre.
+
+    `graphiques` est une liste JSON. Un graphique se décrit ainsi :
+
+        {"titre": "Chiffre d'affaires par mois",
+         "model": "sale.order",              // d'où viennent les données
+         "groupby": ["date_order:month"],    // comment regrouper (jour/semaine/mois/
+                                             //   trimestre/année pour les dates)
+         "mesure": "amount_untaxed",         // quoi additionner ("__count" pour compter)
+         "type": "line",                     // bar | line | pie
+         "domaine": [["state","=","sale"]],  // filtre, facultatif
+         "pleine_largeur": true,             // facultatif : occupe toute la largeur
+         "empile": false}                    // facultatif : barres empilées
+
+    Tout est vérifié avant écriture (modèle, champs, type de mesure) : un tableau de
+    bord qui référence un champ inexistant s'ouvrirait vide sans message d'erreur.
+
+    `rubrique` est le nom de la rubrique de menu (créée si absente). `dashboard_id`
+    permet de remplacer le contenu d'un tableau de bord existant.
+    """
+    c = _get_client()
+
+    specs = _parse(graphiques, [])
+    if isinstance(specs, dict):
+        specs = [specs]
+    if not specs:
+        raise OdooError("Aucun graphique fourni : `graphiques` est une liste JSON.")
+
+    # Validation d'abord : elle fonctionne même en lecture seule, ce qui permet de
+    # vérifier une maquette de tableau de bord avant de demander l'autorisation d'écrire.
+    problemes = dashboards.valider(c, specs)
+    if problemes:
+        raise OdooError("Le tableau de bord n'a pas été créé — à corriger d'abord :\n  "
+                        + "\n  ".join(problemes))
+
+    _require_write(c)
+    classeur = dashboards.construire(nom, specs, sous_titre)
+    donnees = dashboards.encoder(classeur)
+
+    if dashboard_id:
+        c.write("spreadsheet.dashboard", [dashboard_id],
+                {"name": nom, "spreadsheet_binary_data": donnees})
+        cible = dashboard_id
+        action = "remplacé"
+    else:
+        nom_rubrique = rubrique or "Analyses"
+        trouve = c.search_read("spreadsheet.dashboard.group",
+                               [["name", "=", nom_rubrique]], ["id"], limit=1)
+        groupe = trouve[0]["id"] if trouve else c.create(
+            "spreadsheet.dashboard.group", {"name": nom_rubrique})
+        cible = c.create("spreadsheet.dashboard", {
+            "name": nom,
+            "dashboard_group_id": groupe,
+            "spreadsheet_binary_data": donnees,
+            "is_published": True,
+        })
+        action = "créé"
+
+    resume = []
+    for g in specs:
+        resume.append(f"{g.get('titre') or '(sans titre)'} — "
+                      f"{dashboards.TYPES.get((g.get('type') or 'bar').lower(), '')}")
+    return _j({
+        "id": cible,
+        "nom": nom,
+        "statut": f"tableau de bord {action}",
+        "graphiques": resume,
+        "ou_le_voir": f"Menu « Tableaux de bord » → {rubrique or 'Analyses'} → {nom}",
+    })
+
+
+@mcp.tool()
+def odoo_saved_analysis(nom: str, model: str, groupby: str = "[]", mesures: str = "[]",
+                        domaine: str = "[]", vue: str = "pivot",
+                        partage: bool = True) -> str:
+    """Enregistrer une analyse réutilisable, accessible depuis les filtres d'Odoo.
+
+    Crée un « favori » : l'utilisateur le retrouve dans le menu déroulant des filtres
+    de la vue concernée, avec son regroupement et ses mesures déjà en place. Plus léger
+    qu'un tableau de bord, et c'est le réflexe à avoir pour une analyse ponctuelle
+    que le client voudra rejouer lui-même.
+
+    `vue` vaut 'pivot' (tableau croisé) ou 'graph' (graphique). `partage` rend
+    l'analyse visible par tous les utilisateurs plutôt que par le seul auteur.
+    """
+    c = _get_client()
+    _require_write(c)
+
+    champs = c.fields_get(model)
+    gb = [str(x) for x in _parse(groupby, [])]
+    ms = [str(x) for x in _parse(mesures, [])]
+    inconnus = [x.split(":")[0] for x in gb + ms
+                if x.split(":")[0] not in champs and x != "__count"]
+    if inconnus:
+        raise OdooError(f"Champs inconnus sur {model} : {', '.join(inconnus)}")
+
+    contexte = {
+        "group_by": gb,
+        "pivot_measures": ms or ["__count"],
+        "pivot_row_groupby": gb[:1],
+        "pivot_column_groupby": gb[1:2],
+    }
+    filtre_id = c.create("ir.filters", {
+        "name": nom,
+        "model_id": model,
+        "domain": json.dumps(_parse(domaine, [])),
+        "context": json.dumps(contexte),
+        "user_ids": [] if partage else [(6, 0, [c.uid])],
+    })
+    return _j({
+        "id": filtre_id,
+        "nom": nom,
+        "statut": "analyse enregistrée",
+        "ou_la_voir": f"Ouvrir la vue {vue} de « {model} », puis menu « Favoris » → {nom}",
+        "partagee": partage,
+    })
 
 
 def main() -> None:
