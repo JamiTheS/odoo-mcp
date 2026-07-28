@@ -50,6 +50,9 @@ class OdooClient:
         self.timeout = timeout
         self.journal = None          # objet Journal, posé par le serveur si activé
         self.motif_courant = ""      # justification appliquée aux écritures suivantes
+        self.mode_demo = False       # neutralise les e-mails écrits (voir demo.py)
+        self.domaine_demo = "example.com"
+        self.emails_neutralises = 0
         self._uid: int | None = None
         self._models: xmlrpc.client.ServerProxy | None = None
 
@@ -131,6 +134,11 @@ class OdooClient:
         uid = self.uid
         assert self._models is not None
 
+        # Filet de sécurité du mode démonstration : aucune adresse réelle ne doit entrer
+        # dans la base, sinon Odoo enverra de vraies factures à de vraies entreprises.
+        if self.mode_demo and method in WRITE_METHODS:
+            args = self._neutraliser_emails(method, args)
+
         # Capture de l'état AVANT : c'est ce qui permet de dire « X est passé de A à B »
         # dans le rapport, et pas seulement « X a été modifié ».
         avant = self._capturer_avant(model, method, args) if self.journal else None
@@ -145,6 +153,40 @@ class OdooClient:
         if self.journal and method in WRITE_METHODS:
             self._journaliser(model, method, args, resultat, avant)
         return resultat
+
+    # -- sécurité du mode démonstration
+    def _neutraliser_emails(self, method: str, args: list | None):
+        """Réécrit toute adresse vers le domaine réservé, quel que soit l'outil appelant.
+
+        Placé ici plutôt que dans chaque outil : c'est le seul endroit par lequel passent
+        toutes les écritures, donc le seul où la garantie tient vraiment.
+        """
+        from odoo_mcp import demo
+
+        if not args:
+            return args
+        args = list(args)
+        dom = self.domaine_demo
+
+        if method == "create" and isinstance(args[0], dict):
+            args[0], n = demo.assainir_valeurs(args[0], dom)
+            self.emails_neutralises += n
+        elif method == "create" and isinstance(args[0], list):
+            propres, total = [], 0
+            for v in args[0]:
+                nv, n = demo.assainir_valeurs(v, dom)
+                propres.append(nv)
+                total += n
+            args[0], self.emails_neutralises = propres, self.emails_neutralises + total
+        elif method == "write" and len(args) > 1 and isinstance(args[1], dict):
+            args[1], n = demo.assainir_valeurs(args[1], dom)
+            self.emails_neutralises += n
+        elif method == "load" and len(args) > 1:
+            champs = args[0] if isinstance(args[0], list) else []
+            lignes = args[1] if isinstance(args[1], list) else []
+            args[1], n = demo.assainir_lignes(champs, lignes, dom)
+            self.emails_neutralises += n
+        return args
 
     # -- journalisation
     def _capturer_avant(self, model: str, method: str, args: list | None):

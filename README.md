@@ -20,6 +20,9 @@ Claude Desktop, Cursor...**
   au client — ce qui a été fait, et pourquoi.
 - **Tableaux de bord générés** : `odoo_dashboard_create` produit de vrais tableaux de bord
   Odoo dont les graphiques sont recalculés en direct, pas des captures d'écran.
+- **Maquettes de démonstration sûres** : un questionnaire de qualification cadre l'avant-vente,
+  et le mode démonstration neutralise **toute** adresse e-mail écrite — aucune fausse facture
+  ne peut partir chez une vraie entreprise.
 
 ## Installation
 
@@ -83,7 +86,7 @@ de test) :
 }
 ```
 
-## Les 29 outils
+## Les 32 outils
 
 ### Connexion
 
@@ -123,6 +126,14 @@ de test) :
 | `odoo_import_file` | Importer un .xlsx/.csv — modes `inspect`, `check`, `run` |
 | `odoo_export_file` | Exporter une recherche vers .xlsx ou .csv |
 | `odoo_get_attachment` | Télécharger une pièce jointe (PDF de facture, document...) |
+
+### Démonstration et avant-vente
+
+| Outil | Rôle |
+|---|---|
+| `odoo_demo_questionnaire` | Questionnaire de qualification à faire remplir avant une démo |
+| `odoo_demo_mode` | Filet de sécurité : neutralise toute adresse e-mail écrite |
+| `odoo_demo_check` | Audite la base et corrige les adresses réelles restantes |
 
 ### Tableaux de bord
 
@@ -234,6 +245,43 @@ en-têtes des fichiers exportés depuis Odoo sont des libellés d'interface (`Na
 Mapper une colonne sur `id` (External ID) rend l'import **rejouable** : une seconde exécution
 met à jour au lieu de dupliquer. Et `load()` rejette un lot entier en cas d'erreur — un échec
 ne laisse jamais de données à moitié écrites.
+
+## Préparer une démonstration
+
+Deux usages coexistent dans cet outil. Le **consultant** intervient sur des données
+réelles : il lui faut de la traçabilité, d'où le journal et le rapport. L'**avant-vente**
+construit des données fictives pour un prospect : il lui faut de la vraisemblance, vite.
+
+Pour ce second cas, `odoo_demo_questionnaire` fournit une trame de qualification en huit
+sections — le métier, ce qu'il vend, ses achats, son pilotage, sa facturation, **les
+spécificités venant de ses propres clients**, son vocabulaire maison, et le problème qu'il
+cherche à résoudre. C'est ce dernier point qui fait la différence entre une démonstration
+générique et une démonstration où le prospect se reconnaît.
+
+La composition de la maquette n'est pas codée dans le serveur : c'est l'assistant qui
+l'écrit à partir des réponses. Aucun catalogue figé ne produira des noms d'articles et un
+vocabulaire aussi justes qu'un modèle de langage — et surtout, cela fonctionne pour un
+métier qu'on n'avait pas prévu.
+
+### Le filet e-mail, non négociable
+
+Une base de démonstration n'est presque jamais neutralisée : Odoo y envoie de vrais
+courriels dès qu'on confirme une commande ou une facture. Une adresse réelle dans un jeu
+fictif, et une vraie entreprise reçoit une fausse facture.
+
+```
+odoo_demo_mode(actif=true)
+```
+
+Une fois activé, **toute** adresse écrite est réécrite vers `example.com` — domaine
+réservé par la RFC 2606, qui ne peut appartenir à personne. La garantie est posée au seul
+endroit par lequel passent toutes les écritures, elle tient donc quel que soit l'outil
+utilisé : création, modification, upsert, import de fichier, ou même appel brut
+`odoo_execute`. La partie gauche de l'adresse est conservée, donc `jean.dupont@example.com`
+reste lisible à l'écran pendant la démonstration.
+
+`odoo_demo_check` balaie une base reprise de quelqu'un d'autre et signale — ou corrige —
+les adresses qui pourraient encore recevoir du courrier.
 
 ## Générer un tableau de bord
 

@@ -21,7 +21,7 @@ from mcp.server.fastmcp import FastMCP
 
 from datetime import datetime, timedelta
 
-from odoo_mcp import dashboards, files, presentation
+from odoo_mcp import dashboards, demo, files, presentation
 from odoo_mcp.journal import Journal, rendre_html, rendre_markdown
 from odoo_mcp.odoo_client import OdooClient, OdooError, ReadOnlyError, mask
 
@@ -121,6 +121,12 @@ def odoo_status() -> str:
     else:
         etat["journal"] = ("aucun — ouvre-en un avec odoo_journal_start pour tracer "
                            "les écritures et pouvoir produire un rapport")
+    etat["mode_demonstration"] = (
+        {"actif": True, "domaine": c.domaine_demo,
+         "adresses_neutralisees": c.emails_neutralises}
+        if c.mode_demo else
+        "inactif — à activer (odoo_demo_mode) avant de générer des données de "
+        "démonstration, sinon de vrais courriels peuvent partir")
     return _j(etat)
 
 
@@ -740,6 +746,107 @@ def odoo_recent_changes(model: str, jours: int = 7, limit: int = 50,
         })
     return _j({"model": model, "depuis": depuis, "nb": len(lignes),
                "changements": lignes})
+
+
+# --------------------------------------------------- maquettes de démonstration
+@mcp.tool()
+def odoo_demo_questionnaire() -> str:
+    """Obtenir le questionnaire de qualification à faire remplir avant une démonstration.
+
+    À utiliser dès qu'il s'agit de préparer une démonstration pour un prospect : le
+    questionnaire cadre l'entretien et capture ce qui rend une maquette reconnaissable —
+    le métier, le vocabulaire maison, les spécificités venant des clients du prospect,
+    et le problème qu'il cherche à résoudre.
+
+    Présente le questionnaire tel quel à l'utilisateur, y compris son préambule : il
+    explique pourquoi des réponses précises changent tout. N'invente rien à la place des
+    réponses manquantes — signale les hypothèses que tu prends.
+
+    Une fois les réponses obtenues, compose toi-même le plan de maquette et fais-le
+    valider AVANT d'écrire. Les consignes de composition sont incluses dans la réponse.
+    """
+    return _j({
+        "questionnaire": demo.QUESTIONNAIRE,
+        "consignes_de_composition": demo.CONSIGNES_GENERATION,
+        "avant_d_ecrire": "Activer odoo_demo_mode pour neutraliser les adresses e-mail, "
+                          "puis odoo_journal_start pour tracer la génération.",
+    })
+
+
+@mcp.tool()
+def odoo_demo_mode(actif: bool = True, domaine: str = "example.com") -> str:
+    """Activer le filet de sécurité e-mail avant de générer des données de démonstration.
+
+    Une base de démonstration n'est presque jamais neutralisée : Odoo y envoie de vrais
+    courriels à la confirmation d'une commande ou d'une facture. Une adresse réelle dans
+    un jeu fictif, et une vraie entreprise reçoit une fausse facture.
+
+    Une fois ce mode actif, **toute** adresse écrite par n'importe quel outil est
+    réécrite vers un domaine réservé (`example.com` par défaut, réservé par la RFC 2606 :
+    il ne peut appartenir à personne). La partie gauche est conservée, donc l'adresse
+    reste lisible à l'écran pendant la démonstration.
+
+    À activer systématiquement avant toute génération de maquette.
+    """
+    c = _get_client()
+    c.mode_demo = actif
+    c.domaine_demo = domaine or "example.com"
+    if actif:
+        c.emails_neutralises = 0
+    return _j({
+        "mode_demonstration": "actif" if actif else "inactif",
+        "domaine_de_neutralisation": c.domaine_demo if actif else None,
+        "portee": "toutes les écritures, quel que soit l'outil utilisé"
+                  if actif else "aucune",
+    })
+
+
+@mcp.tool()
+def odoo_demo_check(corriger: bool = False, limit: int = 2000) -> str:
+    """Vérifier qu'aucune adresse réelle ne subsiste dans la base avant de démontrer.
+
+    Balaie les contacts et les salariés à la recherche d'adresses pointant vers un
+    domaine qui pourrait réellement recevoir du courrier. À lancer avant une
+    démonstration sur une base reprise de quelqu'un d'autre, ou remplie avant que le
+    mode démonstration n'ait été activé.
+
+    Avec `corriger`, les adresses trouvées sont neutralisées (écriture requise).
+    """
+    c = _get_client()
+    domaine = c.domaine_demo or "example.com"
+    suspects = []
+    for model, champ in (("res.partner", "email"), ("hr.employee", "work_email")):
+        try:
+            recs = c.search_read(model, [[champ, "!=", False]],
+                                 ["display_name", champ], limit=limit)
+        except OdooError:
+            continue
+        for r in recs:
+            if not demo.domaine_sur(r.get(champ) or "", domaine):
+                suspects.append({"model": model, "id": r["id"],
+                                 "nom": r.get("display_name"),
+                                 "email": r.get(champ), "champ": champ})
+
+    if not suspects:
+        return _j({"verdict": "Aucune adresse réelle détectée — la base est sûre.",
+                   "domaine_attendu": domaine})
+
+    if not corriger:
+        return _j({
+            "verdict": f"{len(suspects)} adresse(s) pourraient recevoir du courrier réel.",
+            "risque": "Confirmer une commande ou une facture enverrait un vrai courriel.",
+            "exemples": suspects[:15],
+            "suite": "Relance avec corriger=true pour les neutraliser.",
+        })
+
+    _require_write(c)
+    corrigees = 0
+    for s in suspects:
+        c.write(s["model"], [s["id"]],
+                {s["champ"]: demo.neutraliser(s["email"], domaine)})
+        corrigees += 1
+    return _j({"verdict": f"{corrigees} adresse(s) neutralisée(s) vers @{domaine}.",
+               "base": "sûre pour la démonstration"})
 
 
 # ---------------------------------------------------- tableaux de bord Odoo
