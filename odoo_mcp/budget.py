@@ -19,6 +19,18 @@ Trois principes, dans cet ordre de priorité :
 from __future__ import annotations
 
 import json
+from datetime import datetime
+from pathlib import Path
+
+# Les résultats volumineux sont déposés ici plutôt que rendus dans la conversation.
+# L'assistant dispose d'un outil de lecture de fichiers : lui donner un chemin coûte
+# quelques dizaines de tokens là où la donnée en coûterait des dizaines de milliers.
+DOSSIER_RESULTATS = Path.home() / "odoo-mcp-resultats"
+
+# Estimation tokens : le JSON dense (guillemets, accolades, accents) tourne autour de
+# 3,5 caractères par token, plus bas que la prose française. Reste une approximation
+# assumée — aucun tokeniseur n'est embarqué pour ne pas alourdir l'installation.
+CARACTERES_PAR_TOKEN = 3.5
 
 # Paliers de consommation cumulée (en caractères rendus depuis le début de la session).
 # À 4 caractères par token, 200 000 caractères ~= 50 000 tokens.
@@ -37,6 +49,7 @@ class Budget:
         self.rendu = 0          # caractères effectivement renvoyés
         self.economise = 0      # caractères évités par les troncatures
         self.troncatures = 0
+        self.deportes = 0       # résultats complets écrits sur disque
 
     # -- palier courant
     @property
@@ -67,9 +80,11 @@ class Budget:
         return {
             "palier": self.nom_palier,
             "caracteres_rendus": self.rendu,
-            "tokens_estimes": self.rendu // 4,
+            "tokens_estimes": int(self.rendu / CARACTERES_PAR_TOKEN),
             "caracteres_economises": self.economise,
+            "tokens_economises": int(self.economise / CARACTERES_PAR_TOKEN),
             "troncatures": self.troncatures,
+            "resultats_deportes": self.deportes,
             "reglages_courants": {
                 "taille_max_reponse": self.taille_max,
                 "champs_par_defaut": self.champs_par_defaut,
@@ -87,7 +102,15 @@ class Budget:
             return compact
 
         entier = len(compact)
+        # Avant de rogner : déposer l'intégralité sur disque. Le rognage devient alors
+        # une commodité de lecture et non une perte — rien n'est inaccessible.
+        fichier = _deporter(data)
         reduit = _reduire(data, plafond)
+        if fichier and isinstance(reduit, dict):
+            reduit["fichier_complet"] = str(fichier)
+            reduit["lire_le_reste"] = ("Ouvre ce fichier avec ton outil de lecture pour "
+                                       "obtenir l'intégralité sans repasser par Odoo.")
+            self.deportes += 1
         sortie = _dumps(reduit)
 
         # Dernier recours : la structure ne se prête pas au rognage (texte massif).
@@ -109,6 +132,24 @@ class Budget:
 
 def _dumps(data) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _deporter(data) -> Path | None:
+    """Écrit l'intégralité du résultat sur disque et retourne son chemin.
+
+    Idée reprise du stockage par référence : plutôt que de faire transiter des
+    dizaines de milliers de tokens par la conversation, on dépose la donnée là où
+    l'assistant peut la relire à la demande, et on ne rend qu'un chemin.
+    """
+    try:
+        DOSSIER_RESULTATS.mkdir(parents=True, exist_ok=True)
+        nom = f"resultat_{datetime.now().strftime('%Y%m%d-%H%M%S-%f')[:-3]}.json"
+        chemin = DOSSIER_RESULTATS / nom
+        chemin.write_text(json.dumps(data, ensure_ascii=False, indent=1, default=str),
+                          encoding="utf-8")
+        return chemin
+    except OSError:
+        return None      # un disque plein ne doit pas faire échouer la requête
 
 
 def _cle_liste(data: dict) -> str | None:

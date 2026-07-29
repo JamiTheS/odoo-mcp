@@ -313,6 +313,39 @@ tableurs Odoo : le format o-spreadsheet, les quatre façons de connecter des don
 leur robustesse respective, le choix de la bonne source (`sale.report` plutôt que
 `sale.order`…), et ce que ce connecteur ne génère volontairement pas.
 
+## Économie de contexte
+
+Le serveur régule lui-même ce qu'il renvoie, sans perdre l'accès à la donnée.
+
+**Il rogne, il ne refuse jamais.** Une réponse trop volumineuse est réduite
+progressivement ; les lignes rendues restent complètes, les métadonnées sont préservées,
+et la réponse indique toujours combien de lignes sur combien et l'`offset` pour la suite.
+Une troncature silencieuse mènerait à des conclusions fausses — c'est pire qu'une réponse
+longue.
+
+**Il dépose l'intégralité sur disque.** Quand un résultat dépasse le plafond, le jeu
+complet est écrit dans `~/odoo-mcp-resultats/` et le chemin est renvoyé. L'assistant le
+relit avec son propre outil de lecture, sans repasser par Odoo : quelques dizaines de
+tokens au lieu de dizaines de milliers.
+
+**Il se resserre à mesure que la session avance.**
+
+| Palier | Déclenché à | Plafond | Champs par défaut | Limite par défaut |
+|---|---|---|---|---|
+| confort | départ | 60 k car | 12 | 50 |
+| économie | 200 k rendus | 30 k | 8 | 30 |
+| strict | 500 k | 15 k | 6 | 20 |
+
+**Les défauts sont sobres.** `odoo_search` sans `fields` choisissait autrefois *tous* les
+champs — 169 000 tokens pour dix contacts. Il retient désormais une douzaine de champs
+utiles et écarte les types lourds. `odoo_fields` renvoie une forme compacte
+(`"partner_id":"many2one>res.partner*"`) au lieu de 20 000 tokens de détail.
+
+L'état de consommation est visible à tout moment dans `odoo_status`.
+
+Si le coût permanent des définitions d'outils vous gêne, le levier restant est de
+désactiver dans votre client MCP ceux dont vous ne vous servez pas.
+
 ## Notes de terrain
 
 - Inspecter les champs (`odoo_fields`) **avant** d'écrire : les noms changent entre versions
