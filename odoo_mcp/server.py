@@ -47,8 +47,57 @@ def _get_client() -> OdooClient:
     return _client
 
 
+# Au-delà, la réponse sature le contexte sans rien apporter : mieux vaut la couper et
+# dire comment affiner la requête.
+TAILLE_MAX_REPONSE = 60_000
+
+# Champs volumineux ou sans intérêt en lecture : jamais renvoyés par défaut.
+TYPES_LOURDS = {"binary", "html", "text", "json"}
+PREFIXES_TECHNIQUES = ("message_", "activity_", "rating_", "website_message_",
+                       "access_", "my_activity_", "alias_")
+
+
 def _j(data) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    """Sérialise compact : l'indentation coûtait 17 % de tokens pour rien."""
+    sortie = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(sortie) > TAILLE_MAX_REPONSE:
+        return json.dumps({
+            "erreur": "reponse_trop_volumineuse",
+            "taille": len(sortie),
+            "message": "La réponse dépasse la limite et a été écartée pour ne pas saturer "
+                       "le contexte. Réduis `limit`, restreins `fields` à ce dont tu as "
+                       "besoin, ou affine le domaine.",
+            "apercu": sortie[:2000],
+        }, ensure_ascii=False, separators=(",", ":"))
+    return sortie
+
+
+def _champs_par_defaut(client: OdooClient, model: str, maximum: int = 12) -> list[str]:
+    """Choisit une poignée de champs utiles quand l'appelant n'en précise aucun.
+
+    Sans cela, Odoo renvoie l'intégralité des champs — mesuré à 169 000 tokens pour
+    dix contacts. Le tri privilégie les champs identifiants et courts.
+    """
+    meta = client.fields_get(model, ["type", "string", "store"])
+    prioritaires = [
+        "display_name", "name", "default_code", "reference", "code", "partner_id",
+        "date", "date_order", "date_deadline", "state", "stage_id", "user_id",
+        "amount_untaxed", "amount_total", "list_price", "email", "phone", "city",
+        "product_id", "project_id", "quantity", "product_uom_qty",
+    ]
+    retenus = [c for c in prioritaires if c in meta]
+    if len(retenus) < maximum:
+        for nom, info in meta.items():
+            if len(retenus) >= maximum:
+                break
+            if nom in retenus or nom.startswith(PREFIXES_TECHNIQUES):
+                continue
+            if info.get("type") in TYPES_LOURDS or info.get("store") is False:
+                continue
+            if info.get("type") in ("char", "selection", "date", "datetime", "many2one",
+                                    "integer", "float", "monetary", "boolean"):
+                retenus.append(nom)
+    return retenus[:maximum] or ["display_name"]
 
 
 def _parse(value: str, default):
@@ -72,11 +121,9 @@ def _require_write(c: OdooClient) -> None:
 @mcp.tool()
 def odoo_connect(url: str, username: str, api_key: str, db: str = "",
                  allow_write: bool = False) -> str:
-    """Se connecter à une base Odoo. À appeler en premier si aucune connexion n'est active.
-
-    Les identifiants sont gardés en mémoire du serveur uniquement — jamais écrits sur
-    disque. `db` se déduit du sous-domaine si omis (Odoo Online). Laisser
-    `allow_write` à False : l'écriture s'active séparément via odoo_enable_write.
+    """Se connecter a une base Odoo — a appeler en premier. Identifiants gardes en
+    memoire du serveur seulement, jamais ecrits sur disque. `db` se deduit du
+    sous-domaine si omis. Laisser `allow_write` a False (voir odoo_enable_write).
     """
     global _client
     url = url.strip().rstrip("/")
@@ -132,10 +179,8 @@ def odoo_status() -> str:
 
 @mcp.tool()
 def odoo_enable_write(enable: bool = True) -> str:
-    """Activer (ou couper) l'écriture pour la session.
-
-    À n'appeler qu'après avoir montré à l'utilisateur ce qui va être modifié et obtenu
-    son accord explicite. Les suppressions Odoo sont irréversibles.
+    """Activer (ou couper) l'ecriture. A n'appeler qu'apres avoir montre a l'utilisateur
+    ce qui va etre modifie et obtenu son accord. Les suppressions sont irreversibles.
     """
     c = _get_client()
     c.readonly = not enable
@@ -153,22 +198,51 @@ def odoo_models(name_contains: str = "", limit: int = 100) -> str:
 
 
 @mcp.tool()
-def odoo_fields(model: str, name_contains: str = "", writable_only: bool = False) -> str:
-    """Décrire les champs d'un modèle. À faire AVANT toute écriture : les noms de champs
-    changent entre versions d'Odoo (ex. en 19, is_company existe mais pas company_type)."""
+def odoo_fields(model: str, name_contains: str = "", writable_only: bool = False,
+                detail: bool = False) -> str:
+    """Décrire les champs d'un modèle. À faire AVANT toute écriture : les noms changent
+    entre versions d'Odoo (en 19, `is_company` existe mais pas `company_type`).
+
+    Renvoie par défaut une forme compacte — `"partner_id": "many2one>res.partner*"`, où
+    `*` marque un champ obligatoire. Un modèle Odoo compte souvent 250 champs : la forme
+    détaillée dépasse 20 000 tokens, alors que la compacte suffit à écrire correctement.
+
+    Filtre avec `name_contains`, et n'active `detail` que pour les quelques champs dont tu
+    as besoin des libellés ou des valeurs de sélection.
+    """
     c = _get_client()
     f = c.fields_get(model)
-    out = {}
     needle = name_contains.lower()
+    retenus = {}
     for k in sorted(f):
+        info = f[k]
         if needle and needle not in k.lower() \
-                and needle not in str(f[k].get("string", "")).lower():
+                and needle not in str(info.get("string", "")).lower():
             continue
-        if writable_only and (f[k].get("readonly") or f[k].get("store") is False):
+        if writable_only and (info.get("readonly") or info.get("store") is False):
             continue
-        out[k] = {a: f[k][a] for a in ("string", "type", "relation", "required", "selection")
-                  if f[k].get(a)}
-    return _j(out)
+        if not needle and not detail and k.startswith(PREFIXES_TECHNIQUES):
+            continue
+        retenus[k] = info
+
+    if detail:
+        return _j({k: {a: v[a] for a in ("string", "type", "relation", "required",
+                                         "selection") if v.get(a)}
+                   for k, v in retenus.items()})
+
+    compact = {}
+    for k, v in retenus.items():
+        forme = v.get("type", "?")
+        if v.get("relation"):
+            forme += f">{v['relation']}"
+        if v.get("required"):
+            forme += "*"
+        if v.get("readonly"):
+            forme += " (lecture seule)"
+        compact[k] = forme
+    return _j({"model": model, "nb_champs": len(compact),
+               "legende": "type>relation, * = obligatoire",
+               "champs": compact})
 
 
 @mcp.tool()
@@ -178,10 +252,23 @@ def odoo_search(model: str, domain: str = "[]", fields: str = "[]",
 
     `domain` et `fields` sont des tableaux JSON :
     domain='[["customer_rank",">",0]]'  fields='["name","email"]'.
+
+    **Précise toujours `fields`** : sans lui, une poignée de champs courants est choisie
+    d'office, ce qui n'est presque jamais exactement ce dont tu as besoin.
     """
     c = _get_client()
-    return _j(c.search_read(model, _parse(domain, []), _parse(fields, []),
-                            limit=limit, offset=offset, order=order or None))
+    champs = _parse(fields, [])
+    auto = not champs
+    if auto:
+        champs = _champs_par_defaut(c, model)
+    lignes = c.search_read(model, _parse(domain, []), champs,
+                           limit=limit, offset=offset, order=order or None)
+    if not auto:
+        return _j(lignes)
+    return _j({"champs_choisis_automatiquement": champs,
+               "conseil": "Rappelle odoo_search avec `fields` pour obtenir exactement "
+                          "les champs voulus.",
+               "resultats": lignes})
 
 
 @mcp.tool()
@@ -200,12 +287,9 @@ def odoo_read(model: str, ids: str, fields: str = "[]") -> str:
 
 @mcp.tool()
 def odoo_aggregate(model: str, groupby: str, domain: str = "[]", measures: str = "") -> str:
-    """Agréger : nombre et somme(s) par valeur de `groupby`.
-
-    Remplace read_group, qui n'est plus exposé en RPC depuis Odoo 18.
-    `measures` est une liste JSON de champs à sommer, ex. '["amount_untaxed","amount_total"]'.
-    `groupby` accepte une granularité sur les dates — 'date_order:month' (aussi day, week,
-    quarter, year) : c'est ainsi qu'on obtient un chiffre d'affaires par mois.
+    """Nombre et somme(s) par valeur de `groupby`. Remplace read_group, retire du RPC
+    depuis Odoo 18. `measures` : liste JSON de champs a sommer. Sur une date, granularite
+    `date_order:month` (aussi day/week/quarter/year) — pour un CA par mois.
     """
     c = _get_client()
     parsed = _parse(measures, [])
@@ -216,10 +300,8 @@ def odoo_aggregate(model: str, groupby: str, domain: str = "[]", measures: str =
 
 @mcp.tool()
 def odoo_name_find(model: str, name: str, limit: int = 10) -> str:
-    """Retrouver des enregistrements par leur nom, comme le ferait l'autocomplétion Odoo.
-
-    Le plus rapide pour convertir « le client Polytec » en identifiant avant d'écrire.
-    Cherche aussi sur les champs alternatifs du modèle (référence, code...).
+    """Retrouver des enregistrements par leur nom (autocompletion Odoo). Le plus rapide
+    pour convertir "le client Polytec" en identifiant avant d'ecrire.
     """
     c = _get_client()
     found = c.execute_kw(model, "name_search", [name], {"limit": limit})
@@ -253,11 +335,8 @@ def odoo_write(model: str, ids: str, values: str) -> str:
 
 @mcp.tool()
 def odoo_unlink(model: str, ids: str, confirm_bulk: bool = False) -> str:
-    """Supprimer définitivement des enregistrements. IRRÉVERSIBLE — aucune corbeille.
-
-    Bloqué tant que odoo_enable_write n'a pas été appelé. Au-delà de 50 enregistrements,
-    exige `confirm_bulk` : montre d'abord à l'utilisateur ce qui va disparaître.
-    Souvent, archiver (`odoo_write` avec {"active": false}) est préférable à supprimer.
+    """Supprimer definitivement. IRREVERSIBLE, aucune corbeille. Au-dela de 50, exige
+    `confirm_bulk`. Archiver ({"active": false}) est souvent preferable a supprimer.
     """
     c = _get_client()
     _require_write(c)
@@ -275,11 +354,8 @@ def odoo_unlink(model: str, ids: str, confirm_bulk: bool = False) -> str:
 
 @mcp.tool()
 def odoo_upsert(xmlid: str, model: str, values: str) -> str:
-    """Créer ou mettre à jour un enregistrement identifié par un External ID
-    (ex. 'monprojet.client_acme'). Rejouable sans jamais créer de doublon —
-    à préférer à odoo_create pour toute donnée de maquette ou d'import.
-
-    Bloqué tant que odoo_enable_write n'a pas été appelé.
+    """Creer ou mettre a jour par External ID (ex. 'monprojet.client_acme'). Rejouable
+    sans doublon — a preferer a odoo_create pour toute donnee de maquette ou d'import.
     """
     c = _get_client()
     _require_write(c)
@@ -301,15 +377,13 @@ def odoo_execute(model: str, method: str, args: str = "[]", kwargs: str = "{}") 
 @mcp.tool()
 def odoo_update_where(model: str, domain: str, values: str, confirm: bool = False,
                       max_records: int = 500, motif: str = "") -> str:
-    """Modifier en masse tous les enregistrements correspondant à un domaine.
+    """Modifier en masse les enregistrements d'un domaine.
 
-    Sans `confirm`, ne modifie RIEN : renvoie le nombre d'enregistrements concernés et
-    un échantillon avant/après. Montre ce résultat à l'utilisateur, obtiens son accord,
-    puis rappelle avec confirm=True. C'est le garde-fou qui évite d'écraser 800 fiches
-    sur un domaine mal écrit.
+    Sans `confirm`, ne modifie RIEN : renvoie le nombre concerne et un echantillon
+    avant/apres. Montre-le a l'utilisateur, obtiens son accord, puis rappelle avec
+    confirm=True — garde-fou contre un domaine mal ecrit.
 
-    `motif` justifie la modification dans le rapport d'intervention — renseigne-le,
-    c'est ce que le client lira pour comprendre pourquoi ses données ont changé.
+    `motif` justifie la modification dans le rapport d'intervention.
     """
     c = _get_client()
     dom = _parse(domain, [])
@@ -358,32 +432,17 @@ def odoo_update_where(model: str, domain: str, values: str, confirm: bool = Fals
 def odoo_import_file(path: str, mode: str = "inspect", model: str = "",
                      mapping: str = "{}", sheet: str = "", header_row: int = 1,
                      batch_size: int = 200) -> str:
-    """Importer un fichier Excel/CSV local vers Odoo, en trois temps.
+    """Importer un fichier Excel/CSV local. Le serveur lit le fichier sur disque :
+    aucune limite de volume.
 
-    Le serveur tourne sur la machine de l'utilisateur : il lit le fichier directement,
-    sans le faire transiter par la conversation — c'est ce qui rend possible un import
-    de plusieurs milliers de lignes.
+    Modes a enchainer : inspect (structure, sans connexion), check (valide le mapping
+    sans ecrire), run (importe par lots via load(), atomique par lot).
 
-    Modes, à enchaîner dans cet ordre :
-      - 'inspect' : structure du fichier (colonnes, remplissage, valeurs distinctes,
-        doublons d'identifiant). Aucune connexion requise.
-      - 'check'   : construit les lignes et vérifie les champs contre le modèle,
-        sans rien écrire.
-      - 'run'     : importe réellement, par lots, via load() — l'import natif d'Odoo.
-
-    `mapping` est un objet JSON reliant les colonnes du fichier aux champs Odoo. Les
-    en-têtes des fichiers exportés d'Odoo sont des libellés d'interface ('Name*',
-    'Sales Price'), jamais des noms de champs : ce mapping fait la traduction.
-
-        {"_model": "res.partner",
-         "_columns": {"Code": "id", "Nom": "name", "Pays": "country_id/id",
-                      "Notes": null},
-         "_constants": {"is_company": "True"},
-         "_replace": {"type": {"Goods": "consu"}}}
-
-    Mapper une colonne sur 'id' (External ID) rend l'import rejouable : une seconde
-    exécution met à jour au lieu de dupliquer. load() rejette un lot entier en cas
-    d'erreur, donc un échec ne laisse jamais de données à moitié écrites.
+    `mapping` relie colonnes et champs — les en-tetes des exports Odoo sont des libelles
+    d'interface, pas des noms de champs :
+    {"_model":"res.partner","_columns":{"Code":"id","Nom":"name","Notes":null},
+     "_constants":{"is_company":"True"},"_replace":{"type":{"Goods":"consu"}}}
+    Mapper une colonne sur 'id' rend l'import rejouable sans doublon.
     """
     file_path = Path(path).expanduser()
     if not file_path.exists():
@@ -449,11 +508,8 @@ def odoo_import_file(path: str, mode: str = "inspect", model: str = "",
 @mcp.tool()
 def odoo_export_file(model: str, path: str, domain: str = "[]", fields: str = "[]",
                      limit: int = 10000, order: str = "") -> str:
-    """Exporter le résultat d'une recherche vers un fichier .xlsx ou .csv local.
-
-    Le fichier est écrit directement sur la machine de l'utilisateur. Les relations
-    sont aplaties pour rester lisibles : un many2one devient son libellé.
-    Sans `fields`, exporte les champs stockés les plus courants du modèle.
+    """Exporter une recherche vers un .xlsx ou .csv local. Les relations sont aplaties
+    (un many2one devient son libelle). Sans `fields`, prend les champs les plus courants.
     """
     c = _get_client()
     out_path = Path(path).expanduser()
@@ -479,12 +535,8 @@ def odoo_export_file(model: str, path: str, domain: str = "[]", fields: str = "[
 
 @mcp.tool()
 def odoo_get_attachment(attachment_id: int, path: str = "") -> str:
-    """Télécharger une pièce jointe Odoo (ir.attachment) sur le disque local.
-
-    Utile pour récupérer un PDF de facture, un document lié à une affaire, une image.
-    Pour retrouver l'identifiant : odoo_search sur ir.attachment avec un domaine du type
-    '[["res_model","=","account.move"],["res_id","=",42]]'.
-    Sans `path`, le fichier est écrit dans le dossier courant sous son nom d'origine.
+    """Telecharger une piece jointe (ir.attachment) sur le disque. Pour trouver son id :
+    odoo_search sur ir.attachment avec '[["res_model","=","account.move"],["res_id","=",42]]'.
     """
     c = _get_client()
     meta = c.read("ir.attachment", [attachment_id], ["name", "mimetype"])
@@ -534,16 +586,11 @@ def _journal() -> Journal:
 
 @mcp.tool()
 def odoo_journal_start(titre: str, objectif: str = "", path: str = "") -> str:
-    """Ouvrir un journal d'intervention. À faire AVANT toute écriture.
+    """Ouvrir un journal d'intervention — a faire AVANT toute ecriture.
 
-    Une fois ouvert, chaque création, modification, suppression et import est enregistré
-    automatiquement — y compris l'état des enregistrements AVANT modification. C'est ce
-    qui permet de produire ensuite un rapport expliquant ce qui a changé et pourquoi,
-    sans avoir à retrouver l'information dans l'historique de la conversation.
-
-    `titre` nomme l'intervention (« Maquette Pycarelle », « Reprise du catalogue »),
-    `objectif` explique en une phrase ce qu'on cherche à obtenir : les deux figurent en
-    tête du rapport remis au client.
+    Chaque ecriture est ensuite tracee automatiquement, avec l'etat AVANT modification,
+    ce qui permet de produire un rapport expliquant ce qui a change et pourquoi.
+    `titre` et `objectif` figurent en tete du rapport remis au client.
     """
     c = _get_client()
     uid = c.uid
@@ -563,12 +610,9 @@ def odoo_journal_start(titre: str, objectif: str = "", path: str = "") -> str:
 
 @mcp.tool()
 def odoo_journal_chapter(nom: str, pourquoi: str = "") -> str:
-    """Ouvrir une étape de travail dans le journal.
-
-    Les opérations suivantes y sont rattachées, ce qui structure le rapport en phases
-    lisibles (« Création du référentiel articles », « Correction des adresses »).
-    `pourquoi` est la justification métier de l'étape : c'est elle qui répond à la
-    question « pourquoi cette modification ? » dans le rapport.
+    """Ouvrir une etape de travail dans le journal : les operations suivantes y sont
+    rattachees. `pourquoi` est la justification metier — c'est elle qui repond a
+    "pourquoi cette modification ?" dans le rapport.
     """
     jr = _journal()
     jr.ouvrir_chapitre(nom, pourquoi)
@@ -578,11 +622,9 @@ def odoo_journal_chapter(nom: str, pourquoi: str = "") -> str:
 
 @mcp.tool()
 def odoo_journal_note(texte: str, categorie: str = "note") -> str:
-    """Consigner une décision, une observation ou un point d'attention dans le journal.
-
-    À utiliser pour tout ce qui n'est pas une écriture mais mérite d'être expliqué au
-    client : un arbitrage, une anomalie constatée, une limite technique rencontrée,
-    un sujet laissé de côté. `categorie` peut valoir 'note', 'decision' ou 'alerte'.
+    """Consigner dans le journal ce qui n'est pas une ecriture mais merite d'etre
+    explique au client : arbitrage, anomalie, limite rencontree, sujet ecarte.
+    `categorie` : note, decision ou alerte.
     """
     jr = _journal()
     jr.noter(texte, categorie)
@@ -592,15 +634,10 @@ def odoo_journal_note(texte: str, categorie: str = "note") -> str:
 @mcp.tool()
 def odoo_journal_report(path: str = "", format: str = "html",
                         journal_path: str = "") -> str:
-    """Générer le rapport d'intervention : ce qui a été fait, et pourquoi.
+    """Rapport d'intervention : ce qui a ete fait et pourquoi. Document autonome,
+    presentable au client — synthese, deroule par etape, detail avant/apres.
 
-    Produit un document autonome, présentable tel quel au client : synthèse chiffrée,
-    volumes par modèle, déroulé chronologique par étape, et pour chaque modification
-    le détail avant → après.
-
-    `format` : 'html' (présentable, à ouvrir dans un navigateur ou imprimer en PDF),
-    'markdown' (à intégrer dans un compte rendu), ou 'both'.
-    `journal_path` permet de produire le rapport d'une session antérieure.
+    `format` : html, markdown ou both. `journal_path` pour rejouer une session passee.
     """
     if journal_path:
         chemin = Path(journal_path).expanduser()
@@ -642,15 +679,10 @@ def odoo_journal_report(path: str = "", format: str = "html",
 @mcp.tool()
 def odoo_presentation_guide(path: str = "", format: str = "html",
                             journal_path: str = "") -> str:
-    """Générer le déroulé à suivre pour présenter le travail au client, écran par écran.
+    """Generer le deroule de demonstration a suivre en reunion, ecran par ecran.
 
-    Se fonde sur ce qui a réellement été fait : le guide ne contient que les étapes
-    correspondant aux données mises en place. Pour chaque étape il donne le chemin de
-    menu exact dans Odoo, les clics à faire sous forme de cases à cocher, les
-    enregistrements précis à ouvrir, et une phrase d'accroche à dire au client.
-
-    Pensé pour être ouvert pendant la réunion : on coche au fur et à mesure, on ne
-    saute pas d'étape, et on garde le fil du discours.
+    Deduit de ce qui a reellement ete fait. Chaque etape donne le chemin de menu exact,
+    les clics en cases a cocher, les enregistrements a ouvrir et une phrase d'accroche.
     """
     if journal_path:
         chemin = Path(journal_path).expanduser()
@@ -718,13 +750,9 @@ def odoo_presentation_guide(path: str = "", format: str = "html",
 @mcp.tool()
 def odoo_recent_changes(model: str, jours: int = 7, limit: int = 50,
                         domain: str = "[]") -> str:
-    """Lister ce qui a bougé récemment dans un modèle, d'après Odoo lui-même.
-
-    S'appuie sur les champs d'audit natifs (create_date, write_date, create_uid,
-    write_uid) : contrairement au journal du connecteur, cet outil voit AUSSI les
-    modifications faites directement dans l'interface Odoo par d'autres personnes.
-    Utile pour reprendre le fil d'un dossier ou vérifier ce qui a changé depuis
-    la dernière réunion.
+    """Ce qui a bouge recemment dans un modele, d'apres l'audit natif d'Odoo
+    (write_date, write_uid). Voit AUSSI les modifications faites dans l'interface par
+    d'autres personnes, contrairement au journal du connecteur.
     """
     c = _get_client()
     depuis = (datetime.now() - timedelta(days=jours)).strftime("%Y-%m-%d %H:%M:%S")
@@ -751,19 +779,11 @@ def odoo_recent_changes(model: str, jours: int = 7, limit: int = 50,
 # --------------------------------------------------- maquettes de démonstration
 @mcp.tool()
 def odoo_demo_questionnaire() -> str:
-    """Obtenir le questionnaire de qualification à faire remplir avant une démonstration.
+    """Questionnaire de qualification a faire remplir avant de batir une demo prospect.
 
-    À utiliser dès qu'il s'agit de préparer une démonstration pour un prospect : le
-    questionnaire cadre l'entretien et capture ce qui rend une maquette reconnaissable —
-    le métier, le vocabulaire maison, les spécificités venant des clients du prospect,
-    et le problème qu'il cherche à résoudre.
-
-    Présente le questionnaire tel quel à l'utilisateur, y compris son préambule : il
-    explique pourquoi des réponses précises changent tout. N'invente rien à la place des
-    réponses manquantes — signale les hypothèses que tu prends.
-
-    Une fois les réponses obtenues, compose toi-même le plan de maquette et fais-le
-    valider AVANT d'écrire. Les consignes de composition sont incluses dans la réponse.
+    Presente-le tel quel, preambule compris. N'invente pas les reponses manquantes :
+    signale tes hypotheses. Ensuite compose le plan de maquette et fais-le valider
+    AVANT d'ecrire. Les consignes de composition accompagnent la reponse.
     """
     return _j({
         "questionnaire": demo.QUESTIONNAIRE,
@@ -775,18 +795,12 @@ def odoo_demo_questionnaire() -> str:
 
 @mcp.tool()
 def odoo_demo_mode(actif: bool = True, domaine: str = "example.com") -> str:
-    """Activer le filet de sécurité e-mail avant de générer des données de démonstration.
+    """Filet de securite e-mail — a activer AVANT toute generation de donnees de demo.
 
-    Une base de démonstration n'est presque jamais neutralisée : Odoo y envoie de vrais
-    courriels à la confirmation d'une commande ou d'une facture. Une adresse réelle dans
-    un jeu fictif, et une vraie entreprise reçoit une fausse facture.
-
-    Une fois ce mode actif, **toute** adresse écrite par n'importe quel outil est
-    réécrite vers un domaine réservé (`example.com` par défaut, réservé par la RFC 2606 :
-    il ne peut appartenir à personne). La partie gauche est conservée, donc l'adresse
-    reste lisible à l'écran pendant la démonstration.
-
-    À activer systématiquement avant toute génération de maquette.
+    Les bases de demo ne sont pas neutralisees : Odoo envoie de vrais courriels a la
+    confirmation d'une commande ou d'une facture. Une fois actif, toute adresse ecrite
+    par n'importe quel outil est reecrite vers `example.com` (domaine reserve RFC 2606).
+    La partie gauche est conservee, l'adresse reste lisible en demo.
     """
     c = _get_client()
     c.mode_demo = actif
@@ -803,14 +817,9 @@ def odoo_demo_mode(actif: bool = True, domaine: str = "example.com") -> str:
 
 @mcp.tool()
 def odoo_demo_check(corriger: bool = False, limit: int = 2000) -> str:
-    """Vérifier qu'aucune adresse réelle ne subsiste dans la base avant de démontrer.
-
-    Balaie les contacts et les salariés à la recherche d'adresses pointant vers un
-    domaine qui pourrait réellement recevoir du courrier. À lancer avant une
-    démonstration sur une base reprise de quelqu'un d'autre, ou remplie avant que le
-    mode démonstration n'ait été activé.
-
-    Avec `corriger`, les adresses trouvées sont neutralisées (écriture requise).
+    """Verifier qu'aucune adresse reelle ne subsiste avant de demontrer. Balaie contacts
+    et salaries. A lancer sur une base reprise de quelqu'un d'autre. Avec `corriger`,
+    les adresses trouvees sont neutralisees.
     """
     c = _get_client()
     domaine = c.domaine_demo or "example.com"
@@ -852,10 +861,8 @@ def odoo_demo_check(corriger: bool = False, limit: int = 2000) -> str:
 # ---------------------------------------------------- tableaux de bord Odoo
 @mcp.tool()
 def odoo_dashboard_list() -> str:
-    """Lister les tableaux de bord existants et leurs rubriques.
-
-    Utile pour savoir où ranger un nouveau tableau de bord, et pour repérer ceux
-    livrés par Odoo dont on peut s'inspirer (odoo_dashboard_inspect).
+    """Lister les tableaux de bord et leurs rubriques — pour savoir ou ranger un nouveau
+    tableau de bord, ou reperer ceux d'Odoo dont s'inspirer.
     """
     c = _get_client()
     groupes = c.search_read("spreadsheet.dashboard.group", [], ["name", "sequence"],
@@ -877,10 +884,8 @@ def odoo_dashboard_list() -> str:
 
 @mcp.tool()
 def odoo_dashboard_inspect(dashboard_id: int) -> str:
-    """Décrire le contenu d'un tableau de bord : graphiques, sources, filtres.
-
-    Traduit le JSON interne en description lisible. Pratique pour comprendre comment
-    un tableau de bord Odoo est construit avant d'en créer un semblable.
+    """Decrire le contenu d'un tableau de bord (graphiques, sources, filtres) en clair.
+    Pratique pour s'inspirer d'un tableau de bord Odoo existant.
     """
     c = _get_client()
     rec = c.read("spreadsheet.dashboard", [dashboard_id],
@@ -901,29 +906,18 @@ def odoo_dashboard_inspect(dashboard_id: int) -> str:
 @mcp.tool()
 def odoo_dashboard_create(nom: str, graphiques: str, rubrique: str = "",
                           sous_titre: str = "", dashboard_id: int = 0) -> str:
-    """Créer (ou remplacer) un tableau de bord Odoo à partir d'une liste de graphiques.
+    """Creer (ou remplacer via `dashboard_id`) un tableau de bord Odoo. Les graphiques
+    sont recalcules en direct par Odoo, ce ne sont pas des images.
 
-    Les graphiques sont **recalculés en direct par Odoo** à chaque ouverture : ce ne
-    sont pas des images ni des valeurs figées. Chacun porte sa source, son
-    regroupement, sa mesure et son filtre.
+    `graphiques` est une liste JSON :
+    {"titre":"CA par mois","model":"sale.order","groupby":["date_order:month"],
+     "mesure":"amount_untaxed","type":"line","domaine":[["state","=","sale"]],
+     "pleine_largeur":true}
+    type = bar|line|pie ; mesure "__count" pour compter ; sur une date, granularite
+    `champ:month` (aussi day/week/quarter/year).
 
-    `graphiques` est une liste JSON. Un graphique se décrit ainsi :
-
-        {"titre": "Chiffre d'affaires par mois",
-         "model": "sale.order",              // d'où viennent les données
-         "groupby": ["date_order:month"],    // comment regrouper (jour/semaine/mois/
-                                             //   trimestre/année pour les dates)
-         "mesure": "amount_untaxed",         // quoi additionner ("__count" pour compter)
-         "type": "line",                     // bar | line | pie
-         "domaine": [["state","=","sale"]],  // filtre, facultatif
-         "pleine_largeur": true,             // facultatif : occupe toute la largeur
-         "empile": false}                    // facultatif : barres empilées
-
-    Tout est vérifié avant écriture (modèle, champs, type de mesure) : un tableau de
-    bord qui référence un champ inexistant s'ouvrirait vide sans message d'erreur.
-
-    `rubrique` est le nom de la rubrique de menu (créée si absente). `dashboard_id`
-    permet de remplacer le contenu d'un tableau de bord existant.
+    Modele, champs et mesure sont valides avant ecriture — la validation fonctionne en
+    lecture seule. `rubrique` = rubrique de menu, creee si absente.
     """
     c = _get_client()
 
@@ -980,15 +974,11 @@ def odoo_dashboard_create(nom: str, graphiques: str, rubrique: str = "",
 def odoo_saved_analysis(nom: str, model: str, groupby: str = "[]", mesures: str = "[]",
                         domaine: str = "[]", vue: str = "pivot",
                         partage: bool = True) -> str:
-    """Enregistrer une analyse réutilisable, accessible depuis les filtres d'Odoo.
+    """Enregistrer un favori Odoo : une analyse que le client retrouve dans le menu des
+    filtres de la vue, regroupement et mesures deja en place. Plus leger qu'un tableau
+    de bord — le bon reflexe pour une analyse ponctuelle qu'il rejouera seul.
 
-    Crée un « favori » : l'utilisateur le retrouve dans le menu déroulant des filtres
-    de la vue concernée, avec son regroupement et ses mesures déjà en place. Plus léger
-    qu'un tableau de bord, et c'est le réflexe à avoir pour une analyse ponctuelle
-    que le client voudra rejouer lui-même.
-
-    `vue` vaut 'pivot' (tableau croisé) ou 'graph' (graphique). `partage` rend
-    l'analyse visible par tous les utilisateurs plutôt que par le seul auteur.
+    `vue` : pivot ou graph. `partage` la rend visible par tous.
     """
     c = _get_client()
     _require_write(c)
