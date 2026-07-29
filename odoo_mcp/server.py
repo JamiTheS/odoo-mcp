@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from datetime import datetime, timedelta
 
 from odoo_mcp import dashboards, demo, files, presentation
+from odoo_mcp.budget import Budget
 from odoo_mcp.journal import Journal, rendre_html, rendre_markdown
 from odoo_mcp.odoo_client import OdooClient, OdooError, ReadOnlyError, mask
 
@@ -47,37 +48,30 @@ def _get_client() -> OdooClient:
     return _client
 
 
-# Au-delà, la réponse sature le contexte sans rien apporter : mieux vaut la couper et
-# dire comment affiner la requête.
-TAILLE_MAX_REPONSE = 60_000
-
 # Champs volumineux ou sans intérêt en lecture : jamais renvoyés par défaut.
 TYPES_LOURDS = {"binary", "html", "text", "json"}
 PREFIXES_TECHNIQUES = ("message_", "activity_", "rating_", "website_message_",
                        "access_", "my_activity_", "alias_")
 
+_budget = Budget()
+
 
 def _j(data) -> str:
-    """Sérialise compact : l'indentation coûtait 17 % de tokens pour rien."""
-    sortie = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
-    if len(sortie) > TAILLE_MAX_REPONSE:
-        return json.dumps({
-            "erreur": "reponse_trop_volumineuse",
-            "taille": len(sortie),
-            "message": "La réponse dépasse la limite et a été écartée pour ne pas saturer "
-                       "le contexte. Réduis `limit`, restreins `fields` à ce dont tu as "
-                       "besoin, ou affine le domaine.",
-            "apercu": sortie[:2000],
-        }, ensure_ascii=False, separators=(",", ":"))
-    return sortie
+    """Sérialise compact, en rognant plutôt qu'en refusant si la réponse est trop grosse.
+
+    Le plafond se resserre tout seul à mesure que la session consomme du contexte.
+    """
+    return _budget.rendre(data)
 
 
-def _champs_par_defaut(client: OdooClient, model: str, maximum: int = 12) -> list[str]:
+def _champs_par_defaut(client: OdooClient, model: str, maximum: int = 0) -> list[str]:
     """Choisit une poignée de champs utiles quand l'appelant n'en précise aucun.
 
     Sans cela, Odoo renvoie l'intégralité des champs — mesuré à 169 000 tokens pour
-    dix contacts. Le tri privilégie les champs identifiants et courts.
+    dix contacts. Le tri privilégie les champs identifiants et courts, et le nombre
+    retenu se réduit quand la session a déjà beaucoup consommé.
     """
+    maximum = maximum or _budget.champs_par_defaut
     meta = client.fields_get(model, ["type", "string", "store"])
     prioritaires = [
         "display_name", "name", "default_code", "reference", "code", "partner_id",
@@ -174,6 +168,7 @@ def odoo_status() -> str:
         if c.mode_demo else
         "inactif — à activer (odoo_demo_mode) avant de générer des données de "
         "démonstration, sinon de vrais courriels peuvent partir")
+    etat["budget_contexte"] = _budget.etat()
     return _j(etat)
 
 
@@ -247,28 +242,38 @@ def odoo_fields(model: str, name_contains: str = "", writable_only: bool = False
 
 @mcp.tool()
 def odoo_search(model: str, domain: str = "[]", fields: str = "[]",
-                limit: int = 50, offset: int = 0, order: str = "") -> str:
-    """Rechercher et lire des enregistrements.
+                limit: int = 0, offset: int = 0, order: str = "") -> str:
+    """Rechercher et lire des enregistrements. Renvoie aussi le total correspondant au
+    domaine, ce qui évite un appel odoo_count separe.
 
     `domain` et `fields` sont des tableaux JSON :
     domain='[["customer_rank",">",0]]'  fields='["name","email"]'.
 
-    **Précise toujours `fields`** : sans lui, une poignée de champs courants est choisie
+    **Precise toujours `fields`** : sans lui, une poignee de champs courants est choisie
     d'office, ce qui n'est presque jamais exactement ce dont tu as besoin.
     """
     c = _get_client()
+    dom = _parse(domain, [])
     champs = _parse(fields, [])
     auto = not champs
     if auto:
         champs = _champs_par_defaut(c, model)
-    lignes = c.search_read(model, _parse(domain, []), champs,
-                           limit=limit, offset=offset, order=order or None)
-    if not auto:
-        return _j(lignes)
-    return _j({"champs_choisis_automatiquement": champs,
-               "conseil": "Rappelle odoo_search avec `fields` pour obtenir exactement "
-                          "les champs voulus.",
-               "resultats": lignes})
+    limite = limit or _budget.limite_par_defaut
+
+    total = c.search_count(model, dom)
+    lignes = c.search_read(model, dom, champs,
+                           limit=limite, offset=offset, order=order or None)
+
+    reponse: dict = {"model": model, "total_correspondant": total,
+                     "affiches": len(lignes)}
+    if auto:
+        reponse["champs_choisis_automatiquement"] = champs
+        reponse["conseil"] = ("Rappelle avec `fields` pour obtenir exactement les "
+                              "champs voulus.")
+    if total > offset + len(lignes):
+        reponse["suite"] = f"offset={offset + len(lignes)} pour la suite"
+    reponse["resultats"] = lignes
+    return _j(reponse)
 
 
 @mcp.tool()
