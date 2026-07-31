@@ -44,10 +44,16 @@ MODELES: dict[str, tuple[str, str, str]] = {
     "stock.warehouse": ("Entrepôts", "Inventaire", "Inventaire → Configuration → Entrepôts"),
     "stock.route": ("Règles de réapprovisionnement", "Inventaire",
                     "Inventaire → Configuration → Routes"),
+    "stock.lot": ("Lots et numéros de série", "Inventaire",
+                  "Inventaire → Articles → Lots/numéros de série"),
+    "uom.uom": ("Unités de mesure", "Inventaire",
+                "Inventaire → Configuration → Unités de mesure"),
     # Comptabilité
     "account.move": ("Factures et pièces comptables", "Comptabilité",
                      "Comptabilité → Clients → Factures"),
     "account.move.line": ("Lignes comptables", "Comptabilité", "Détail d'une facture"),
+    "account.journal": ("Journaux comptables", "Comptabilité",
+                        "Comptabilité → Configuration → Journaux"),
     "account.payment": ("Paiements", "Comptabilité", "Comptabilité → Clients → Paiements"),
     "account.analytic.account": ("Sections analytiques (affaires, chantiers)",
                                  "Comptabilité",
@@ -79,11 +85,13 @@ OPERATIONS = {
     "create": "Création",
     "write": "Modification",
     "unlink": "Suppression",
+    "copy": "Duplication",
     "load": "Import de données",
     "action_confirm": "Validation",
     "button_confirm": "Validation",
     "action_post": "Comptabilisation",
     "button_validate": "Validation",
+    "action_done": "Clôture",
     "action_cancel": "Annulation",
     "toggle_active": "Archivage",
 }
@@ -94,15 +102,12 @@ def nom_metier(model: str) -> str:
     entree = MODELES.get(model)
     if entree:
         return entree[0]
-    # Repli lisible pour un modèle non répertorié (souvent un modèle sur mesure).
+    # Repli lisible pour un modèle non répertorié (souvent un modèle sur mesure) :
+    # casse interne préservée, seule la première lettre passe en majuscule.
     if model.startswith("x_"):
-        return model[2:].replace("_", " ").capitalize() + " (objet sur mesure)"
+        nom = model[2:].replace("_", " ")
+        return nom[:1].upper() + nom[1:] + " (objet sur mesure)"
     return model.replace(".", " ").replace("_", " ").capitalize()
-
-
-def module(model: str) -> str:
-    entree = MODELES.get(model)
-    return entree[1] if entree else "—"
 
 
 def chemin(model: str) -> str:

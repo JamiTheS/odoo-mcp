@@ -1,6 +1,6 @@
 [project]
 name = "odoo-mcp"
-version = "1.8.0"
+version = "1.9.0"
 description = "Serveur MCP pour piloter une base Odoo via XML-RPC : lecture, écriture gardée, import/export Excel, journal d'audit, rapport d'intervention, guide de démonstration client, génération de tableaux de bord et maquettes de démonstration sécurisées. Aucun identifiant stocké."
 readme = "README.md"
 license = { text = "MIT" }

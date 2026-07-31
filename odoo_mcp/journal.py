@@ -12,6 +12,7 @@ lisible/diffable. Le rapport HTML/Markdown est généré à la demande.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -19,6 +20,53 @@ from pathlib import Path
 from odoo_mcp import lexique
 
 IRREVERSIBLES = {"unlink"}
+
+# Champs dont la valeur ne doit jamais apparaître dans un journal (insensible à la casse).
+CLES_SENSIBLES = frozenset({
+    "password", "passwd", "api_key", "token", "secret", "acc_number", "iban", "pin",
+})
+# Préfixes de champs portant du binaire base64, inutile (et volumineux) dans un journal.
+PREFIXES_BINAIRES = ("image_", "datas", "raw")
+LIMITE_BINAIRE = 500   # au-delà, une chaîne est probablement du base64
+LIMITE_CHAINE = 200    # plafond d'affichage des valeurs textuelles
+
+
+def _assainir(valeur, cle: str = ""):
+    """Prépare une valeur pour le journal : secrets masqués (« *** »), binaires
+    base64 résumés à un marqueur de taille, chaînes plafonnées. Récursif sur les
+    dicts et listes imbriqués (commandes x2many incluses)."""
+    if isinstance(valeur, dict):
+        return {k: "***" if str(k).lower() in CLES_SENSIBLES else _assainir(v, str(k))
+                for k, v in valeur.items()}
+    if isinstance(valeur, (list, tuple)):
+        return [_assainir(v, cle) for v in valeur]
+    if isinstance(valeur, str):
+        if len(valeur) > LIMITE_BINAIRE or cle.lower().startswith(PREFIXES_BINAIRES):
+            return f"<binaire, {len(valeur)} caractères>"
+        if len(valeur) > LIMITE_CHAINE:
+            return valeur[:LIMITE_CHAINE] + "…"
+    return valeur
+
+
+def _restreindre(path: Path, mode: int) -> None:
+    """Permissions minimales ; tolère les plateformes qui ignorent chmod."""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _lire_jsonl(path: Path) -> tuple[list[dict], int]:
+    """Parse un JSONL en ignorant les lignes corrompues : (entrées, nb ignorées)."""
+    entrees, ignorees = [], 0
+    for ligne in path.read_text(encoding="utf-8").splitlines():
+        if not ligne.strip():
+            continue
+        try:
+            entrees.append(json.loads(ligne))
+        except json.JSONDecodeError:
+            ignorees += 1
+    return entrees, ignorees
 
 
 class Journal:
@@ -32,10 +80,10 @@ class Journal:
         self.titre = titre or "Session de travail"
         self.objectif = objectif
         self.chapitre = ""
-        self.motif = ""
         self.debut = datetime.now()
         self.entrees: list[dict] = []
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        _restreindre(self.path.parent, 0o700)
         self._ecrire({
             "type": "session",
             "ts": self.debut.isoformat(timespec="seconds"),
@@ -44,6 +92,7 @@ class Journal:
             "base": base,
             "utilisateur": utilisateur,
         })
+        _restreindre(self.path, 0o600)
 
     # ---------------------------------------------------------------- écriture
     def _ecrire(self, entree: dict) -> None:
@@ -67,6 +116,10 @@ class Journal:
     def enregistrer(self, model: str, methode: str, nb: int,
                     ids: list | None = None, avant: list | None = None,
                     apres=None, motif: str = "", outil: str = "") -> None:
+        """Trace une écriture Odoo. `avant` et `apres` sont assainis avant stockage :
+        les clés sensibles (CLES_SENSIBLES) sont masquées, les binaires base64
+        résumés à un marqueur de taille et les chaînes plafonnées — le journal ne
+        doit jamais contenir de secret ni peser plusieurs Mo."""
         entree = {
             "type": "operation",
             "ts": _now(),
@@ -77,9 +130,9 @@ class Journal:
             "operation": lexique.operation(methode),
             "nb": nb,
             "ids": (ids or [])[:200],
-            "avant": (avant or [])[:20],
-            "apres": apres,
-            "motif": motif or self.motif,
+            "avant": _assainir((avant or [])[:20]),
+            "apres": _assainir(apres),
+            "motif": motif,
             "irreversible": methode in IRREVERSIBLES,
             "outil": outil,
         }
@@ -89,36 +142,47 @@ class Journal:
     # ---------------------------------------------------------------- lecture
     @staticmethod
     def charger(path: Path) -> tuple[dict, list[dict]]:
-        """Relit un journal existant : (métadonnées de session, entrées)."""
+        """Relit un journal existant : (métadonnées de session, entrées).
+        Les lignes JSON corrompues sont ignorées."""
+        j = Journal.depuis_fichier(path)
+        return j.session or {}, j.entrees
+
+    @classmethod
+    def depuis_fichier(cls, path) -> "Journal":
+        """Retourne une instance SANS effet de bord disque (pas d'écriture, pas de
+        chmod), avec .entrees (list[dict]) et .session (dict de l'entrée 'session'
+        la plus récente ou None). Parsing tolérant : les lignes JSON corrompues
+        sont ignorées et comptées dans .lignes_ignorees (int)."""
+        path = Path(path)
         if not path.exists():
             raise FileNotFoundError(path)
-        session, entrees = {}, []
-        for ligne in path.read_text(encoding="utf-8").splitlines():
-            if not ligne.strip():
-                continue
-            e = json.loads(ligne)
-            if e.get("type") == "session":
-                session = e
-            else:
-                entrees.append(e)
-        return session, entrees
+        brut, ignorees = _lire_jsonl(path)
+        obj = cls.__new__(cls)
+        obj.path = path
+        obj.session = next((e for e in reversed(brut)
+                            if e.get("type") == "session"), None)
+        obj.entrees = [e for e in brut if e.get("type") != "session"]
+        obj.lignes_ignorees = ignorees
+        return obj
 
     def synthese(self) -> dict:
-        """Chiffres clés : volumes par opération et par modèle."""
-        ops = [e for e in self.entrees if e["type"] == "operation"]
+        """Chiffres clés : volumes par opération et par modèle. Tolère les
+        journaux anciens ou retouchés à la main (clés manquantes)."""
+        ops = [e for e in self.entrees if e.get("type") == "operation"]
         par_operation: dict[str, int] = {}
         par_model: dict[str, dict[str, int]] = {}
         for e in ops:
-            par_operation[e["operation"]] = par_operation.get(e["operation"], 0) + e["nb"]
-            slot = par_model.setdefault(e["model"], {})
-            slot[e["operation"]] = slot.get(e["operation"], 0) + e["nb"]
+            op, nb, model = e.get("operation", "?"), e.get("nb", 0), e.get("model", "?")
+            par_operation[op] = par_operation.get(op, 0) + nb
+            slot = par_model.setdefault(model, {})
+            slot[op] = slot.get(op, 0) + nb
         return {
             "operations": len(ops),
-            "enregistrements": sum(e["nb"] for e in ops),
+            "enregistrements": sum(e.get("nb", 0) for e in ops),
             "par_operation": par_operation,
             "par_model": par_model,
-            "irreversibles": sum(e["nb"] for e in ops if e["irreversible"]),
-            "sans_motif": sum(1 for e in ops if not e["motif"]),
+            "irreversibles": sum(e.get("nb", 0) for e in ops if e.get("irreversible")),
+            "sans_motif": sum(1 for e in ops if not e.get("motif")),
         }
 
 
@@ -139,6 +203,14 @@ def _valeur(v) -> str:
 
 
 # --------------------------------------------------------------------- rapports
+def _md(v) -> str:
+    """Échappe le minimum pour qu'une valeur ne casse pas un tableau Markdown."""
+    return str(v).replace("|", "\\|")
+
+
+PREFIXES_NOTES = {"decision": "Décision : ", "alerte": "Alerte : "}
+
+
 def rendre_markdown(session: dict, entrees: list[dict], synthese: dict) -> str:
     L = []
     L.append(f"# {session.get('titre', 'Session de travail')}")
@@ -158,7 +230,7 @@ def rendre_markdown(session: dict, entrees: list[dict], synthese: dict) -> str:
     L.append("| Opération | Enregistrements |")
     L.append("|---|---|")
     for op, n in sorted(synthese["par_operation"].items(), key=lambda kv: -kv[1]):
-        L.append(f"| {op} | {n} |")
+        L.append(f"| {_md(op)} | {n} |")
     L.append("")
     if synthese["irreversibles"]:
         L.append(f"> {synthese['irreversibles']} suppressions définitives — "
@@ -173,7 +245,8 @@ def rendre_markdown(session: dict, entrees: list[dict], synthese: dict) -> str:
         for model, ops in sorted(synthese["par_model"].items(),
                                  key=lambda kv: -sum(kv[1].values())):
             detail = ", ".join(f"{op.lower()} : {n}" for op, n in sorted(ops.items()))
-            L.append(f"| {lexique.nom_metier(model)} | {detail} | {sum(ops.values())} |")
+            L.append(f"| {_md(lexique.nom_metier(model))} | {_md(detail)} "
+                     f"| {sum(ops.values())} |")
         L.append("")
 
     L.append("## Déroulé")
@@ -196,7 +269,7 @@ def rendre_markdown(session: dict, entrees: list[dict], synthese: dict) -> str:
                 for nom in _noms_supprimes(e):
                     L.append(f"  - supprimé : {nom}")
             else:
-                for a in (e.get("avant") or [])[:3]:
+                for a in (e.get("avant") or [])[:5]:
                     champs = {k: v for k, v in a.items()
                               if k not in ("id", "display_name")}
                     if champs and isinstance(e.get("apres"), dict):
@@ -205,7 +278,8 @@ def rendre_markdown(session: dict, entrees: list[dict], synthese: dict) -> str:
                             for k, v in champs.items())
                         L.append(f"  - {a.get('display_name', a.get('id'))} — {detail}")
         else:
-            L.append(f"- `{_heure(e['ts'])}` *{e.get('texte', '')}*")
+            prefixe = PREFIXES_NOTES.get(e["type"], "")
+            L.append(f"- `{_heure(e['ts'])}` *{prefixe}{e.get('texte', '')}*")
     L.append("")
     return "\n".join(L)
 
@@ -264,6 +338,8 @@ def rendre_html(session: dict, entrees: list[dict], synthese: dict) -> str:
  .old{{background:#fbeeec;padding:1px 5px;border-radius:3px}}
  .new{{background:#eaf3ee;padding:1px 5px;border-radius:3px;font-weight:600}}
  .note{{background:#fdf3dc;border-radius:6px;padding:10px 14px;margin:10px 0;font-size:14px}}
+ .note.decision{{background:#e8f0fb}}
+ .note.alerte{{background:#fbeaea}}
  footer{{color:{GREY};font-size:12px;margin-top:40px;border-top:1px solid #e6ebef;padding-top:14px}}
  @media print{{header{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
 </style></head><body>
@@ -345,7 +421,8 @@ def rendre_html(session: dict, entrees: list[dict], synthese: dict) -> str:
                     parts.append(f'<div class="diff">{nom} — {diffs}</div>')
             parts.append("</div>")
         else:
-            parts.append(f'<div class="note">{escape(e.get("texte", ""))}</div>')
+            cls = f" {e['type']}" if e["type"] in ("decision", "alerte") else ""
+            parts.append(f'<div class="note{cls}">{escape(e.get("texte", ""))}</div>')
     if not ouvert and not entrees:
         parts.append("<p style='color:#5b6b7a'>Aucune opération enregistrée.</p>")
 

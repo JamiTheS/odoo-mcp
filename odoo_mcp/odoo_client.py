@@ -1,26 +1,40 @@
-"""Client Odoo XML-RPC — connexion par variables d'environnement, aucun stockage.
+"""Client Odoo XML-RPC utilisé par le serveur MCP (odoo_mcp.server), aucun stockage.
 
-Les identifiants (URL, login, clé API) sont fournis par l'utilisateur au début de la
-conversation et passés à chaque commande en variables d'environnement inline :
+Les identifiants (URL, login, clé API) sont lus dans les variables d'environnement
+(ODOO_URL, ODOO_USERNAME, ODOO_API_KEY, et en option ODOO_DB, ODOO_ALLOW_WRITE,
+ODOO_TIMEOUT) par `OdooClient.from_env`. Rien n'est jamais écrit sur disque.
 
-    ODOO_URL=https://acme.odoo.com ODOO_USERNAME=a@b.c ODOO_API_KEY=xxx \\
-        python odoo_query.py search res.partner
-
-Rien n'est jamais écrit sur disque : ce skill est fait pour être partagé, chaque
-utilisateur entre les identifiants de SA base au lancement.
+Deux garde-fous vivent ici, au seul endroit par où passent tous les appels :
+- la lecture seule par défaut : seules les méthodes de READ_METHODS passent tant que
+  l'écriture n'a pas été activée explicitement (outil odoo_enable_write) ;
+- la neutralisation des e-mails en mode démonstration (voir odoo_mcp.demo).
 """
 
 from __future__ import annotations
 
+import datetime
+import http.client
 import os
+import socket
 import sys
 import xmlrpc.client
 from typing import Any
 
-# Méthodes refusées tant que ODOO_ALLOW_WRITE n'est pas activé.
+from odoo_mcp import demo
+
+# Seules ces méthodes passent tant que ODOO_ALLOW_WRITE n'est pas activé.
+READ_METHODS = {
+    "read", "search", "search_read", "search_count", "read_group", "fields_get",
+    "name_search", "name_get", "default_get", "check_access_rights", "get_views",
+    "get_view", "fields_view_get", "onchange", "web_read_group",
+}
+
+# Méthodes qui modifient la base : neutralisation e-mail (mode démo) et journalisation.
 WRITE_METHODS = {
     "create", "write", "unlink", "copy", "load", "action_confirm", "button_confirm",
     "action_post", "button_validate", "action_cancel", "action_done", "toggle_active",
+    "message_post", "name_create", "action_archive", "action_unarchive", "action_draft",
+    "activity_schedule", "message_subscribe", "action_send_and_print",
 }
 
 
@@ -36,7 +50,7 @@ def mask(secret: str) -> str:
     """N'affiche jamais une clé en clair dans un log ou une sortie."""
     if not secret:
         return "(vide)"
-    return f"{'*' * 8}{secret[-4:]}" if len(secret) > 4 else "****"
+    return f"{'*' * 8}{secret[-2:]}" if len(secret) > 2 else "****"
 
 
 class OdooClient:
@@ -68,9 +82,8 @@ class OdooClient:
             raise OdooError(
                 "Identifiants manquants : " + ", ".join(missing) + ".\n"
                 "Demande à l'utilisateur l'URL de sa base, son login et sa clé API, puis "
-                "passe-les en variables d'environnement inline sur chaque commande :\n"
-                "  ODOO_URL=https://acme.odoo.com ODOO_USERNAME=a@b.c ODOO_API_KEY=xxx "
-                "python odoo_query.py ...\n"
+                "passe-les en variables d'environnement du serveur MCP "
+                "(ODOO_URL, ODOO_USERNAME, ODOO_API_KEY).\n"
                 "Ne les écris dans aucun fichier."
             )
         db = os.environ.get("ODOO_DB", "").strip()
@@ -78,7 +91,13 @@ class OdooClient:
             # Odoo Online : la base porte le nom du sous-domaine.
             db = url.split("//")[-1].split("/")[0].split(".")[0]
         allow_write = os.environ.get("ODOO_ALLOW_WRITE", "").strip().lower() in ("1", "true", "yes")
-        timeout = int(os.environ.get("ODOO_TIMEOUT", "60"))
+        brut = os.environ.get("ODOO_TIMEOUT", "60").strip()
+        try:
+            timeout = int(brut)
+        except ValueError:
+            raise OdooError(
+                f"ODOO_TIMEOUT={brut!r} n'est pas un nombre de secondes valide."
+            ) from None
         return cls(url=url, db=db, username=username, api_key=api_key,
                    readonly=not allow_write, timeout=timeout)
 
@@ -125,11 +144,12 @@ class OdooClient:
     # -- appel générique
     def execute_kw(self, model: str, method: str, args: list | None = None,
                    kwargs: dict | None = None) -> Any:
-        if self.readonly and method in WRITE_METHODS:
+        if self.readonly and method not in READ_METHODS:
             raise ReadOnlyError(
-                f"Mode lecture seule : '{model}.{method}' est bloqué. "
-                "L'écriture s'active via l'outil odoo_enable_write (ou ODOO_ALLOW_WRITE=1) — "
-                "uniquement après confirmation explicite de l'utilisateur."
+                f"Mode lecture seule : '{model}.{method}' n'est pas une méthode de "
+                "lecture autorisée. L'écriture s'active via l'outil odoo_enable_write "
+                "(ou ODOO_ALLOW_WRITE=1) — uniquement après confirmation explicite de "
+                "l'utilisateur."
             )
         uid = self.uid
         assert self._models is not None
@@ -149,9 +169,24 @@ class OdooClient:
             )
         except xmlrpc.client.Fault as exc:
             raise OdooError(f"{model}.{method} : {_short_fault(exc.faultString)}") from exc
+        except (socket.timeout, ConnectionError, OSError, http.client.HTTPException,
+                xmlrpc.client.ProtocolError) as exc:
+            raise OdooError(
+                f"{self.url} injoignable pendant {model}.{method} : {exc}"
+            ) from exc
+
+        # copy duplique aussi l'adresse réelle de la source : réécriture immédiate.
+        if self.mode_demo and method == "copy":
+            resultat = self._neutraliser_copie(model, resultat)
 
         if self.journal and method in WRITE_METHODS:
-            self._journaliser(model, method, args, resultat, avant)
+            try:
+                self._journaliser(model, method, args, resultat, avant)
+            except Exception as exc:
+                # L'écriture Odoo a déjà réussi : ne jamais laisser croire le contraire
+                # à cause d'un journal en échec (l'appelant pourrait rejouer → doublon).
+                print(f"Avertissement : journalisation impossible ({exc})",
+                      file=sys.stderr)
         return resultat
 
     # -- sécurité du mode démonstration
@@ -159,10 +194,9 @@ class OdooClient:
         """Réécrit toute adresse vers le domaine réservé, quel que soit l'outil appelant.
 
         Placé ici plutôt que dans chaque outil : c'est le seul endroit par lequel passent
-        toutes les écritures, donc le seul où la garantie tient vraiment.
+        toutes les écritures, donc le seul où la garantie tient vraiment. Les commandes
+        x2many ((0, 0, vals) / (1, id, vals)) sont descendues par demo.assainir_valeurs.
         """
-        from odoo_mcp import demo
-
         if not args:
             return args
         args = list(args)
@@ -188,6 +222,36 @@ class OdooClient:
             self.emails_neutralises += n
         return args
 
+    def _neutraliser_copie(self, model: str, new_id):
+        """Après un `copy`, réécrit neutralisés les champs e-mail du nouvel enregistrement.
+
+        `copy` n'a pas de valeurs à assainir en entrée : il duplique telles quelles les
+        données de la source, y compris une éventuelle adresse réelle.
+        """
+        rid = new_id[0] if isinstance(new_id, list) else new_id
+        if not isinstance(rid, int):
+            return new_id
+        try:
+            presents = [c for c in demo.CHAMPS_EMAIL if c in self.fields_get(model)]
+            if presents:
+                rec = self.read(model, [rid], presents)[0]
+                a_ecrire = {
+                    c: demo.neutraliser(rec[c], self.domaine_demo)
+                    for c in presents
+                    if isinstance(rec.get(c), str)
+                    and not demo.domaine_sur(rec[c], self.domaine_demo)
+                }
+                if a_ecrire:
+                    self.write(model, [rid], a_ecrire)
+                    self.emails_neutralises += len(a_ecrire)
+        except Exception as exc:
+            raise OdooError(
+                f"{model}.copy : la copie {rid} a été créée mais la neutralisation de "
+                f"ses adresses e-mail a échoué ({exc}) — elle peut contenir une adresse "
+                "réelle. Vérifie-la avant toute utilisation."
+            ) from exc
+        return new_id
+
     # -- journalisation
     def _capturer_avant(self, model: str, method: str, args: list | None):
         if method not in ("write", "unlink", "toggle_active") or not args:
@@ -200,7 +264,7 @@ class OdooClient:
             champs += [k for k in args[1] if not k.startswith("_")]
         try:
             return self.execute_kw(model, "read", [ids[:20], champs])
-        except OdooError:
+        except Exception:
             return None   # un champ illisible ne doit jamais bloquer l'écriture
 
     def _journaliser(self, model, method, args, resultat, avant) -> None:
@@ -266,7 +330,23 @@ class OdooClient:
             slot = out.setdefault(key, {"count": 0})
             slot["count"] += 1
             for m in measures:
-                slot[m] = slot.get(m, 0.0) + (r.get(m) or 0)
+                valeur = r.get(m) or 0
+                if not isinstance(valeur, (int, float)):
+                    raise OdooError(
+                        f"aggregate : la mesure '{m}' n'est pas numérique sur {model} "
+                        f"(valeur {valeur!r}) — on ne peut sommer qu'un champ "
+                        "integer/float/monetary, pas un char ou un many2one."
+                    )
+                slot[m] = slot.get(m, 0.0) + valeur
+        if len(rows) >= limit:
+            # La limite de lecture est atteinte : les sommes ne couvrent qu'une partie
+            # du domaine. Sans ce marqueur, le résultat serait pris pour un total.
+            out["_tronque"] = {
+                "count": limit,
+                "message": f"{limit} lignes lues (limite atteinte) : les sommes sont "
+                           "partielles. Réduis le domaine (période, société…) ou "
+                           "regroupe par plus grosses mailles.",
+            }
         return dict(sorted(out.items()))
 
     # -- écriture
@@ -296,7 +376,8 @@ class OdooClient:
         if not name:
             module, name = "__import__", xmlid
         r = self.execute_kw("ir.model.data", "search_read",
-                            [[["module", "=", module], ["name", "=", name]], ["res_id"]])
+                            [[["module", "=", module], ["name", "=", name]], ["res_id"]],
+                            {"limit": 1})
         return r[0]["res_id"] if r else None
 
     def set_ref(self, xmlid: str, model: str, res_id: int) -> None:
@@ -315,12 +396,25 @@ class OdooClient:
         C'est ce qui rend un script rejouable sans créer de doublon.
         """
         existing = self.ref(xmlid)
-        if existing:
+        if existing and self.read(model, [existing], ["id"]):
             if update:
                 self.write(model, [existing], values)
             return existing
         new_id = self.create(model, values)
-        self.set_ref(xmlid, model, new_id)
+        if existing:
+            # Xmlid orphelin : l'enregistrement pointé a été supprimé. On rebranche
+            # l'External ID existant sur le nouvel enregistrement plutôt que de
+            # laisser remonter un Fault obscur au write suivant.
+            module, _, name = xmlid.partition(".")
+            if not name:
+                module, name = "__import__", xmlid
+            imd = self.execute_kw("ir.model.data", "search",
+                                  [[["module", "=", module], ["name", "=", name]]],
+                                  {"limit": 1})
+            if imd:
+                self.execute_kw("ir.model.data", "write", [imd, {"res_id": new_id}])
+        else:
+            self.set_ref(xmlid, model, new_id)
         return new_id
 
 
@@ -347,7 +441,6 @@ def _group_key(value, granularity: str = "") -> str:
     if granularity == "month":
         return f"{y}-{m:02d}"
     if granularity == "week":
-        import datetime
         iso = datetime.date(y, m, d).isocalendar()
         return f"{iso[0]}-S{iso[1]:02d}"
     return date_part
@@ -398,4 +491,4 @@ class _TimeoutSafeTransport(_TimeoutMixin, xmlrpc.client.SafeTransport):
 
 
 if __name__ == "__main__":
-    sys.exit("Ce fichier est une bibliothèque. Utilise odoo_connect.py / odoo_query.py.")
+    sys.exit("Ce module est une bibliothèque, utilisée par odoo_mcp.server (serveur MCP).")

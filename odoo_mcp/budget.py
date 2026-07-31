@@ -19,6 +19,7 @@ Trois principes, dans cet ordre de priorité :
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -27,13 +28,17 @@ from pathlib import Path
 # quelques dizaines de tokens là où la donnée en coûterait des dizaines de milliers.
 DOSSIER_RESULTATS = Path.home() / "odoo-mcp-resultats"
 
+# Rotation des déports : au-delà, les plus vieux sont supprimés au prochain déport.
+PURGE_AGE_JOURS = 7
+PURGE_MAX_FICHIERS = 50
+
 # Estimation tokens : le JSON dense (guillemets, accolades, accents) tourne autour de
 # 3,5 caractères par token, plus bas que la prose française. Reste une approximation
 # assumée — aucun tokeniseur n'est embarqué pour ne pas alourdir l'installation.
 CARACTERES_PAR_TOKEN = 3.5
 
 # Paliers de consommation cumulée (en caractères rendus depuis le début de la session).
-# À 4 caractères par token, 200 000 caractères ~= 50 000 tokens.
+# À 3,5 caractères par token, 200 000 caractères ~= 57 000 tokens.
 PALIERS = [
     # (seuil, nom, taille max d'une reponse, champs par defaut, limite par defaut)
     (0,       "confort",  60_000, 12, 50),
@@ -123,9 +128,10 @@ class Budget:
                                             "ou affine le domaine.",
                 "debut": compact[:plafond - 400],
             })
+        sortie = sortie[:plafond]   # coupe dure : rien ne dépasse le plafond
 
         self.troncatures += 1
-        self.economise += entier - len(sortie)
+        self.economise += max(entier - len(sortie), 0)
         self.rendu += len(sortie)
         return sortie
 
@@ -143,6 +149,7 @@ def _deporter(data) -> Path | None:
     """
     try:
         DOSSIER_RESULTATS.mkdir(parents=True, exist_ok=True)
+        _purger()
         nom = f"resultat_{datetime.now().strftime('%Y%m%d-%H%M%S-%f')[:-3]}.json"
         chemin = DOSSIER_RESULTATS / nom
         chemin.write_text(json.dumps(data, ensure_ascii=False, indent=1, default=str),
@@ -150,6 +157,22 @@ def _deporter(data) -> Path | None:
         return chemin
     except OSError:
         return None      # un disque plein ne doit pas faire échouer la requête
+
+
+def _purger() -> None:
+    """Supprime les déports trop vieux et plafonne le nombre de fichiers conservés."""
+    try:
+        fichiers = sorted(DOSSIER_RESULTATS.glob("resultat_*.json"),
+                          key=lambda p: p.stat().st_mtime)
+        limite = time.time() - PURGE_AGE_JOURS * 86400
+        for p in fichiers:
+            if p.stat().st_mtime < limite:
+                p.unlink(missing_ok=True)
+        fichiers = [p for p in fichiers if p.exists()]
+        for p in fichiers[:-PURGE_MAX_FICHIERS]:
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass           # une purge en échec ne doit jamais faire échouer la requête
 
 
 def _cle_liste(data: dict) -> str | None:

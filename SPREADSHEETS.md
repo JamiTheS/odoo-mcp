@@ -23,7 +23,7 @@ ce qui rend la génération possible.
 
 ```
 {
-  "version": "18.5.10",
+  "version": "18.5.10",               // schéma Odoo 18/19 — voir le tableau en bas
   "sheets": [ { "id", "name", "cells", "styles", "figures": [...] } ],
   "styles" / "formats" / "borders",     // bibliothèques de mise en forme
   "pivots": {},                          // tableaux croisés déclarés
@@ -140,8 +140,56 @@ Pour découvrir les champs disponibles : `odoo_fields("sale.report")`.
 - Les **indicateurs chiffrés** et les **jauges** ne sont pas générés (voir plus haut).
 - Les **filtres globaux** d'un tableau de bord ne sont pas générés : ils exigent un
   `fieldMatching` par graphique, à maintenir manuellement.
-- La **version du format** est fixée à celle observée sur Odoo 19 (`18.5.10`). Odoo
-  migre les anciens formats à l'ouverture, mais un format plus récent que le serveur
-  poserait problème.
+- La **version du schéma** du classeur dépend du serveur cible : `odoo_dashboard_create`
+  lit la version du serveur connecté et émet le schéma correspondant (voir le tableau
+  ci-dessous). Si la version est indéterminable, le schéma Odoo 18/19 est émis — un
+  format plus récent que le serveur poserait problème, alors qu'un format plus ancien
+  est migré par Odoo à l'ouverture.
 - Un tableau de bord généré est **remplaçable** (`dashboard_id`) mais pas fusionnable :
   la génération écrase le contenu.
+
+## Version du schéma selon la version d'Odoo
+
+Le champ `version` du JSON pilote les migrations o-spreadsheet au chargement ; la clé
+`odooVersion` pilote les migrations propres à Odoo (filtres, pivots). Valeurs émises
+par le connecteur (constante `SCHEMAS` de `dashboards.py`) :
+
+| Odoo | `version` | `odooVersion` | Particularités |
+|---|---|---|---|
+| 16 | `12.5` (nombre) | `5` | pas de `settings`, titre de graphique en chaîne |
+| 17 | `14.5` (nombre) | `6` | titre en chaîne, pas de `customTableStyles` |
+| 18 | `"18.5.10"` | — | schéma de référence |
+| 19 | `"18.5.10"` | — | migré à l'ouverture (étapes `19.1.1` à `19.3.10`) |
+
+Avant Odoo 18, les clés absentes du schéma (`humanize`, `cumulatedStart`, `fillArea`,
+`chartId`, `dataSets`, `fieldMatching`, `metaData.mode`, et l'objet `title`) sont
+omises plutôt qu'ignorées. Odoo 19 restructure les graphiques à l'ouverture
+(`odoo_bar` → `bar`, `chartOdooMenusReferences` → `odooLinkReferences`) : émettre le
+schéma 18 est le chemin prévu, Odoo livre lui-même ses tableaux de bord de démo en
+`18.5.10` sur la branche master.
+
+Sources vérifiées (juillet 2026) :
+
+- `CURRENT_VERSION`, par branche d'o-spreadsheet :
+  <https://github.com/odoo/o-spreadsheet/blob/16.0/src/migrations/data.ts> (12.5),
+  <https://github.com/odoo/o-spreadsheet/blob/17.0/src/migrations/data.ts> (14.5)
+- `ODOO_VERSION` et migrations Odoo :
+  <https://github.com/odoo/odoo/blob/16.0/addons/spreadsheet/static/src/o_spreadsheet/migration.js> (5),
+  <https://github.com/odoo/odoo/blob/17.0/addons/spreadsheet/static/src/o_spreadsheet/migration.js> (6),
+  <https://github.com/odoo/odoo/blob/18.0/addons/spreadsheet/static/src/o_spreadsheet/migration.js> (12),
+  <https://github.com/odoo/odoo/blob/master/addons/spreadsheet/static/src/o_spreadsheet/migration.js> (étapes `18.5.10`, `19.1.1`, `19.3.10`)
+- Classeurs de démo livrés par Odoo (versions et clés réellement présentes) :
+  `addons/spreadsheet_dashboard_sale/data/files/product_dashboard.json` sur les
+  branches [16.0](https://github.com/odoo/odoo/blob/16.0/addons/spreadsheet_dashboard_sale/data/files/product_dashboard.json),
+  [17.0](https://github.com/odoo/odoo/blob/17.0/addons/spreadsheet_dashboard_sale/data/files/product_dashboard.json),
+  [18.0](https://github.com/odoo/odoo/blob/18.0/addons/spreadsheet_dashboard_sale/data/files/product_dashboard.json)
+  et [master](https://github.com/odoo/odoo/blob/master/addons/spreadsheet_dashboard_sale/data/files/product_dashboard.json)
+- Clés lues par un graphique Odoo en 16.0 :
+  <https://github.com/odoo/odoo/blob/16.0/addons/spreadsheet/static/src/chart/odoo_chart/odoo_chart.js>
+  (`type`, `metaData`, `searchParams`, `title`, `background`, `legendPosition` —
+  les clés inconnues sont ignorées)
+
+Points non vérifiés : la valeur exacte exportée par un Odoo 18.0 neuf (les démos
+livrées sont en `21`, la branche o-spreadsheet 18.0 exporte `22` — le schéma `18.5.10`
+est accepté car postérieur, aucune migration ne s'applique) ; les versions saas
+intermédiaires (`saas~16.x`/`17.x`/`18.x`) sont rabattues sur leur version majeure.

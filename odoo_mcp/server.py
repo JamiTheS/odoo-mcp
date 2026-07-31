@@ -103,6 +103,15 @@ def _parse(value: str, default):
         raise OdooError(f"JSON invalide : {value!r} ({exc.msg})")
 
 
+def _parse_ids(value: str) -> list:
+    """Parse `ids` JSON et exige un tableau d'identifiants ('42' seul est refusé)."""
+    ids = _parse(value, [])
+    if not isinstance(ids, list):
+        raise OdooError(f"`ids` doit être un tableau JSON d'identifiants, ex. '[1,2]' "
+                        f"(reçu : {value!r}).")
+    return ids
+
+
 def _require_write(c: OdooClient) -> None:
     if c.readonly:
         raise ReadOnlyError(
@@ -280,7 +289,7 @@ def odoo_count(model: str, domain: str = "[]") -> str:
 def odoo_read(model: str, ids: str, fields: str = "[]") -> str:
     """Lire des enregistrements par identifiants. `ids` est un tableau JSON, ex. '[1,2]'."""
     c = _get_client()
-    return _j(c.read(model, _parse(ids, []), _parse(fields, [])))
+    return _j(c.read(model, _parse_ids(ids), _parse(fields, [])))
 
 
 @mcp.tool()
@@ -326,8 +335,13 @@ def odoo_write(model: str, ids: str, values: str) -> str:
     """
     c = _get_client()
     _require_write(c)
-    ok = c.write(model, _parse(ids, []), _parse(values, {}))
-    return _j({"model": model, "ids": _parse(ids, []), "written": ok})
+    id_list = _parse_ids(ids)
+    vals = _parse(values, {})
+    if not isinstance(vals, dict):
+        raise OdooError("`values` doit être un objet JSON, ex. '{\"name\":\"ACME\"}' "
+                        f"(reçu : {values!r}).")
+    ok = c.write(model, id_list, vals)
+    return _j({"model": model, "ids": id_list, "written": ok})
 
 
 @mcp.tool()
@@ -337,7 +351,7 @@ def odoo_unlink(model: str, ids: str, confirm_bulk: bool = False) -> str:
     """
     c = _get_client()
     _require_write(c)
-    id_list = _parse(ids, [])
+    id_list = _parse_ids(ids)
     if len(id_list) > 50 and not confirm_bulk:
         noms = c.read(model, id_list[:5], ["display_name"])
         raise OdooError(
@@ -364,8 +378,9 @@ def odoo_upsert(xmlid: str, model: str, values: str) -> str:
 def odoo_execute(model: str, method: str, args: str = "[]", kwargs: str = "{}") -> str:
     """Appeler n'importe quelle méthode d'un modèle (execute_kw brut).
 
-    Les méthodes d'écriture (create, write, unlink, load, action_confirm, ...) restent
-    bloquées tant que odoo_enable_write n'a pas été appelé.
+    En lecture seule, l'appel passe par une liste blanche de méthodes de lecture tenue
+    côté client ; les méthodes d'écriture (create, write, unlink, load,
+    action_confirm, ...) restent bloquées tant que odoo_enable_write n'a pas été appelé.
     """
     c = _get_client()
     return _j(c.execute_kw(model, method, _parse(args, []), _parse(kwargs, {})))
@@ -388,9 +403,10 @@ def odoo_update_where(model: str, domain: str, values: str, confirm: bool = Fals
         raise OdooError("`values` est vide : rien à modifier.")
 
     ids = c.execute_kw(model, "search", [dom], {"limit": max_records + 1})
+    total = c.search_count(model, dom)
     if len(ids) > max_records:
         raise OdooError(
-            f"{len(ids)}+ enregistrements visés, au-delà de la limite de {max_records}. "
+            f"{total} enregistrements visés, au-delà de la limite de {max_records}. "
             "Restreins le domaine, ou relance en augmentant max_records en connaissance "
             "de cause."
         )
@@ -398,6 +414,12 @@ def odoo_update_where(model: str, domain: str, values: str, confirm: bool = Fals
         return _j({"model": model, "concernes": 0, "message": "Aucun enregistrement."})
 
     champs = sorted(vals)
+    connus = c.fields_get(model)
+    inconnus = sorted(f for f in champs if f not in connus)
+    if inconnus:
+        raise OdooError(f"Champ inconnu : {', '.join(inconnus)} (sur {model}). "
+                        "Vérifie l'orthographe avec odoo_fields avant de réessayer.")
+
     avant = c.read(model, ids[:5], ["display_name"] + champs)
     apercu = [{"id": r["id"], "nom": r.get("display_name"),
                "avant": {k: files.flatten(r.get(k)) for k in champs},
@@ -406,7 +428,7 @@ def odoo_update_where(model: str, domain: str, values: str, confirm: bool = Fals
     if not confirm:
         return _j({
             "mode": "PREVISUALISATION - rien n'a ete modifie",
-            "model": model, "concernes": len(ids), "modifications": vals,
+            "model": model, "concernes": total, "modifications": vals,
             "apercu": apercu,
             "suite": "Fais valider ces changements par l'utilisateur, puis rappelle "
                      "odoo_update_where avec confirm=true.",
@@ -438,6 +460,9 @@ def odoo_import_file(path: str, mode: str = "inspect", model: str = "",
      "_constants":{"is_company":"True"},"_replace":{"type":{"Goods":"consu"}}}
     Colonne mappee sur 'id' = import rejouable sans doublon.
     """
+    if batch_size < 1:
+        raise OdooError("`batch_size` doit être un entier >= 1 (taille des lots "
+                        f"d'import, reçu : {batch_size}).")
     file_path = Path(path).expanduser()
     if not file_path.exists():
         raise OdooError(f"Fichier introuvable : {file_path}")
@@ -501,12 +526,17 @@ def odoo_import_file(path: str, mode: str = "inspect", model: str = "",
 
 @mcp.tool()
 def odoo_export_file(model: str, path: str, domain: str = "[]", fields: str = "[]",
-                     limit: int = 10000, order: str = "") -> str:
+                     limit: int = 10000, order: str = "", ecraser: bool = False) -> str:
     """Exporter une recherche vers un .xlsx/.csv local. Relations aplaties (many2one ->
     libelle). Sans `fields`, prend les champs courants.
+
+    Refuse d'écraser un fichier existant : relancer avec `ecraser=true` pour forcer.
     """
     c = _get_client()
     out_path = Path(path).expanduser()
+    if out_path.exists() and not ecraser:
+        raise OdooError(f"Le fichier {out_path} existe déjà. Choisis un autre chemin, "
+                        "ou relance avec ecraser=true pour le remplacer.")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     cols = _parse(fields, [])
@@ -531,6 +561,9 @@ def odoo_export_file(model: str, path: str, domain: str = "[]", fields: str = "[
 def odoo_get_attachment(attachment_id: int, path: str = "") -> str:
     """Telecharger une piece jointe (ir.attachment). Trouver son id : odoo_search sur
     ir.attachment, domaine '[["res_model","=","account.move"],["res_id","=",42]]'.
+
+    Le nom vient d'Odoo : seul son dernier composant est retenu (jamais de '../').
+    Un fichier existant n'est jamais écrasé — choisir un autre répertoire.
     """
     c = _get_client()
     meta = c.read("ir.attachment", [attachment_id], ["name", "mimetype"])
@@ -557,12 +590,21 @@ def odoo_get_attachment(attachment_id: int, path: str = "") -> str:
     brut = contenu.data if hasattr(contenu, "data") else contenu
     octets = base64.b64decode(brut) if isinstance(brut, str) else bytes(brut)
 
-    out_path = Path(path).expanduser() if path else Path.cwd() / meta["name"]
+    # meta["name"] vient d'Odoo et peut contenir des séparateurs : on ne garde que le
+    # nom de base, avec un repli si rien d'exploitable n'en sort.
+    nom = Path(str(meta["name"])).name
+    if not nom or nom in (".", ".."):
+        nom = f"piece-jointe-{attachment_id}"
+
+    out_path = Path(path).expanduser() if path else Path.cwd() / nom
     if out_path.is_dir():
-        out_path = out_path / meta["name"]
+        out_path = out_path / nom
+    if out_path.exists():
+        raise OdooError(f"Le fichier {out_path} existe déjà et ne sera pas écrasé : "
+                        "choisis un autre répertoire via `path`.")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(octets)
-    return _j({"fichier": str(out_path), "nom": meta["name"],
+    return _j({"fichier": str(out_path), "nom": nom,
                "type": meta.get("mimetype"), "octets": out_path.stat().st_size})
 
 
@@ -576,6 +618,26 @@ def _journal() -> Journal:
             "avec leur état avant/après, et un rapport présentable pourra être généré."
         )
     return c.journal
+
+
+def _synthese_depuis_journal(journal_path: str):
+    """Recharge un journal passé SANS effet de bord disque.
+
+    Renvoie (chemin, session, entrées, synthèse) pour odoo_journal_report et
+    odoo_presentation_guide. Les lignes JSON corrompues sont ignorées (comptées dans
+    la clé 'lignes_ignorees' de la synthèse si non nul).
+    """
+    chemin = Path(journal_path).expanduser()
+    if not chemin.is_file():
+        raise OdooError(f"Journal introuvable : {chemin}")
+    try:
+        jr = Journal.depuis_fichier(chemin)
+    except OSError as exc:
+        raise OdooError(f"Journal illisible : {chemin} ({exc})") from exc
+    synthese = jr.synthese()
+    if jr.lignes_ignorees:
+        synthese["lignes_ignorees"] = jr.lignes_ignorees
+    return chemin, jr.session or {}, jr.entrees, synthese
 
 
 @mcp.tool()
@@ -629,11 +691,7 @@ def odoo_journal_report(path: str = "", format: str = "html",
     detail avant/apres. `format` : html|markdown|both. `journal_path` : session passee.
     """
     if journal_path:
-        chemin = Path(journal_path).expanduser()
-        session, entrees = Journal.charger(chemin)
-        temporaire = Journal.__new__(Journal)
-        temporaire.entrees = entrees
-        synthese = Journal.synthese(temporaire)
+        chemin, session, entrees, synthese = _synthese_depuis_journal(journal_path)
     else:
         jr = _journal()
         chemin = jr.path
@@ -672,11 +730,7 @@ def odoo_presentation_guide(path: str = "", format: str = "html",
     ete fait. Chemin de menu exact, clics en cases a cocher, phrase d'accroche.
     """
     if journal_path:
-        chemin = Path(journal_path).expanduser()
-        session, entrees = Journal.charger(chemin)
-        temporaire = Journal.__new__(Journal)
-        temporaire.entrees = entrees
-        synthese = Journal.synthese(temporaire)
+        chemin, session, entrees, synthese = _synthese_depuis_journal(journal_path)
     else:
         jr = _journal()
         chemin = jr.path
@@ -754,7 +808,7 @@ def odoo_recent_changes(model: str, jours: int = 7, limit: int = 50,
         lignes.append({
             "id": r["id"],
             "nom": r.get("display_name"),
-            "etat": "créé" if cree[:16] == modifie[:16] else "modifié",
+            "etat": "créé" if cree == modifie else "modifié",
             "le": modifie,
             "par": files.flatten(r.get("write_uid")),
         })
@@ -784,11 +838,18 @@ def odoo_demo_mode(actif: bool = True, domaine: str = "example.com") -> str:
 
     Les bases de demo ne sont pas neutralisees : confirmer une commande ou une facture
     envoie un VRAI courriel. Une fois actif, toute adresse ecrite par n'importe quel
-    outil est reecrite vers `example.com`. Partie gauche conservee (lisible en demo).
+    outil est reecrite vers `domaine`. Partie gauche conservee (lisible en demo).
+    `domaine` doit etre injoignable (example.com, ...) : un domaine reel est refuse.
     """
     c = _get_client()
+    domaine = (domaine or "example.com").strip().lower()
+    if actif and domaine not in demo.DOMAINES_SURS:
+        raise OdooError(
+            f"Domaine refusé : {domaine!r}. Les adresses neutralisées y seraient "
+            "réécrites ; s'il est réellement joignable, de vrais courriels partiraient. "
+            "Domaines sûrs : " + ", ".join(sorted(demo.DOMAINES_SURS)))
     c.mode_demo = actif
-    c.domaine_demo = domaine or "example.com"
+    c.domaine_demo = domaine
     if actif:
         c.emails_neutralises = 0
     return _j({
@@ -799,35 +860,52 @@ def odoo_demo_mode(actif: bool = True, domaine: str = "example.com") -> str:
     })
 
 
+# (modèle, [champs à auditer]) — ajouter une ligne ici suffit à étendre l'audit.
+AUDIT_EMAILS = (
+    ("res.partner", ["email"]),
+    ("hr.employee", ["work_email"]),
+    ("crm.lead", ["email_from"]),
+    ("res.users", ["login", "email"]),
+)
+
+
 @mcp.tool()
 def odoo_demo_check(corriger: bool = False, limit: int = 2000) -> str:
-    """Verifier qu'aucune adresse reelle ne subsiste avant de demontrer (contacts et
-    salaries). Avec `corriger`, les adresses trouvees sont neutralisees.
+    """Verifier qu'aucune adresse reelle ne subsiste avant de demontrer. Audite contacts
+    (res.partner), salaries (hr.employee), pistes (crm.lead) et utilisateurs (res.users),
+    au plus `limit` enregistrements par modele et par champ ("tronque" le signale).
+    Avec `corriger`, les adresses trouvees sont neutralisees.
     """
     c = _get_client()
     domaine = c.domaine_demo or "example.com"
     suspects = []
-    for model, champ in (("res.partner", "email"), ("hr.employee", "work_email")):
-        try:
-            recs = c.search_read(model, [[champ, "!=", False]],
-                                 ["display_name", champ], limit=limit)
-        except OdooError:
-            continue
-        for r in recs:
-            if not demo.domaine_sur(r.get(champ) or "", domaine):
-                suspects.append({"model": model, "id": r["id"],
-                                 "nom": r.get("display_name"),
-                                 "email": r.get(champ), "champ": champ})
+    tronque = False
+    for model, champs in AUDIT_EMAILS:
+        for champ in champs:
+            try:
+                recs = c.search_read(model, [[champ, "!=", False]],
+                                     ["display_name", champ], limit=limit)
+            except OdooError:
+                continue
+            if len(recs) >= limit:
+                tronque = True
+            for r in recs:
+                if not demo.domaine_sur(str(r.get(champ) or ""), domaine):
+                    suspects.append({"model": model, "id": r["id"],
+                                     "nom": r.get("display_name"),
+                                     "email": r.get(champ), "champ": champ})
 
     if not suspects:
         return _j({"verdict": "Aucune adresse réelle détectée — la base est sûre.",
-                   "domaine_attendu": domaine})
+                   "domaine_attendu": domaine,
+                   "limite_par_modele": limit, "tronque": tronque})
 
     if not corriger:
         return _j({
             "verdict": f"{len(suspects)} adresse(s) pourraient recevoir du courrier réel.",
             "risque": "Confirmer une commande ou une facture enverrait un vrai courriel.",
             "exemples": suspects[:15],
+            "limite_par_modele": limit, "tronque": tronque,
             "suite": "Relance avec corriger=true pour les neutraliser.",
         })
 
@@ -915,7 +993,12 @@ def odoo_dashboard_create(nom: str, graphiques: str, rubrique: str = "",
                         + "\n  ".join(problemes))
 
     _require_write(c)
-    classeur = dashboards.construire(nom, specs, sous_titre)
+    try:
+        version_serveur = c.version().get("server_version")
+    except OdooError:
+        version_serveur = None  # indéterminable : schéma par défaut (Odoo 18/19)
+    classeur = dashboards.construire(nom, specs, sous_titre,
+                                     version_odoo=version_serveur)
     donnees = dashboards.encoder(classeur)
 
     if dashboard_id:
@@ -976,13 +1059,18 @@ def odoo_saved_analysis(nom: str, model: str, groupby: str = "[]", mesures: str 
         "pivot_row_groupby": gb[:1],
         "pivot_column_groupby": gb[1:2],
     }
-    filtre_id = c.create("ir.filters", {
+    valeurs = {
         "name": nom,
         "model_id": model,
         "domain": json.dumps(_parse(domaine, [])),
         "context": json.dumps(contexte),
-        "user_ids": [] if partage else [(6, 0, [c.uid])],
-    })
+    }
+    # Visibilité : user_ids (m2m) n'existe qu'en Odoo >= 16 ; avant, user_id (m2o).
+    if "user_ids" in c.fields_get("ir.filters"):
+        valeurs["user_ids"] = [] if partage else [(6, 0, [c.uid])]
+    else:
+        valeurs["user_id"] = False if partage else c.uid
+    filtre_id = c.create("ir.filters", valeurs)
     return _j({
         "id": filtre_id,
         "nom": nom,

@@ -92,32 +92,19 @@ ETAPES = [
                     "catalogue, aux prix négociés.",
     },
     {
-        "cle": "reception",
-        "titre": "La réception et le stock",
+        "cle": "stock",
+        "titre": "Les mouvements de stock (réceptions et livraisons)",
         "models": ["stock.picking", "stock.move", "stock.quant"],
         "module": "Inventaire",
         "chemin": "Inventaire → Aperçu",
         "actions": [
             "Montrer les tuiles : réceptions à traiter, livraisons à préparer",
-            "Ouvrir une réception et cliquer sur « Valider »",
+            "Ouvrir une opération de la démonstration — réception ou livraison — "
+            "et cliquer sur « Valider »",
             "Retourner sur l'article : la quantité en stock a bougé",
         ],
         "accroche": "Le stock n'est plus un fichier à part : il se met à jour tout seul, "
                     "au rythme des réceptions et des livraisons.",
-    },
-    {
-        "cle": "livraison",
-        "titre": "La livraison au client",
-        "models": ["stock.picking"],
-        "module": "Inventaire",
-        "chemin": "Inventaire → Aperçu → Livraisons",
-        "actions": [
-            "Ouvrir la livraison issue de la commande client",
-            "Valider la livraison",
-            "Revenir sur la commande : les quantités livrées y apparaissent",
-        ],
-        "accroche": "Ce qui est livré remonte automatiquement sur la commande : c'est ce "
-                    "qui permet de facturer juste, sans repointer à la main.",
     },
     {
         "cle": "temps",
@@ -182,6 +169,20 @@ ETAPES = [
 # Modèles trop techniques pour mériter une étape de démonstration à eux seuls.
 DISCRETS = {"ir.attachment", "ir.model.data", "mail.message", "res.users", "res.company"}
 
+# Points de préparation et de clôture — source unique partagée par les deux rendus.
+AVANT_DE_COMMENCER = [
+    "Se connecter à Odoo et garder l'onglet ouvert, prêt à projeter",
+    "Vérifier que les données de démonstration sont bien visibles",
+    "Compter environ 5 minutes par étape",
+    "Cocher les cases au fur et à mesure pour ne rien oublier",
+]
+POUR_CONCLURE = [
+    "Rappeler le bénéfice principal : une seule saisie, reprise automatiquement "
+    "à chaque étape suivante",
+    "Demander au client quelle étape il souhaite approfondir",
+    "Noter les demandes d'ajustement pour la prochaine séance",
+]
+
 
 def construire(models_touches: set[str], session: dict,
                exemples: dict[str, list[str]] | None = None) -> list[dict]:
@@ -195,7 +196,8 @@ def construire(models_touches: set[str], session: dict,
         noms = []
         for m in concernes:
             noms.extend(exemples.get(m, []))
-        guide.append({**etape, "objets": concernes, "exemples": noms[:5]})
+        guide.append({**etape, "objets": concernes,
+                      "exemples": list(dict.fromkeys(noms))[:5]})
 
     couverts = {m for e in guide for m in e["models"]}
     restants = sorted(models_touches - couverts - DISCRETS)
@@ -221,10 +223,8 @@ def rendre_markdown(session: dict, guide: list[dict], synthese: dict) -> str:
     if session.get("objectif"):
         L += [f"**Ce qu'on veut montrer :** {session['objectif']}", ""]
     L += [f"**Base de démonstration :** {session.get('base', '?')}", ""]
-    L += ["## Avant de commencer", "",
-          "- Se connecter à Odoo et garder l'onglet ouvert",
-          "- Vérifier que les données de démonstration sont bien visibles",
-          "- Prévoir 5 minutes par étape ci-dessous", ""]
+    L += ["## Avant de commencer", ""]
+    L += [f"- {p}" for p in AVANT_DE_COMMENCER] + [""]
     L += [f"## Le parcours ({len(guide)} étapes)", ""]
     for i, e in enumerate(guide, 1):
         L += [f"### Étape {i} — {e['titre']}", ""]
@@ -237,10 +237,8 @@ def rendre_markdown(session: dict, guide: list[dict], synthese: dict) -> str:
         L += ["", f"> **À dire :** {e['accroche']}", ""]
     L += ["## Pour conclure", "",
           f"En résumé : {synthese['enregistrements']} enregistrements ont été mis en place "
-          f"pour cette démonstration.",
-          "", "- Rappeler le bénéfice principal : une seule saisie, reprise à chaque étape",
-          "- Demander au client quelle étape il souhaite approfondir",
-          "- Noter les demandes d'ajustement pour la prochaine séance", ""]
+          f"pour cette démonstration.", ""]
+    L += [f"- {p}" for p in POUR_CONCLURE] + [""]
     return "\n".join(L)
 
 
@@ -291,11 +289,8 @@ def rendre_html(session: dict, guide: list[dict], synthese: dict) -> str:
              f'&nbsp;·&nbsp; {len(guide)} étapes</div></div></header><div class="wrap">')
 
     P.append('<h2>Avant de commencer</h2><div class="prep"><ul>'
-             '<li>Se connecter à Odoo et garder l\'onglet ouvert, prêt à projeter</li>'
-             '<li>Vérifier que les données de démonstration sont visibles</li>'
-             '<li>Compter environ 5 minutes par étape</li>'
-             '<li>Cocher les cases au fur et à mesure pour ne rien oublier</li>'
-             '</ul></div>')
+             + "".join(f"<li>{escape(p)}</li>" for p in AVANT_DE_COMMENCER)
+             + "</ul></div>")
 
     P.append("<h2>Le parcours</h2>")
     for i, e in enumerate(guide, 1):
@@ -315,11 +310,8 @@ def rendre_html(session: dict, guide: list[dict], synthese: dict) -> str:
     P.append('<h2>Pour conclure</h2><div class="prep"><ul>'
              f'<li>{synthese["enregistrements"]} enregistrements ont été mis en place '
              'pour cette démonstration</li>'
-             '<li>Rappeler le bénéfice principal : une seule saisie, reprise '
-             'automatiquement à chaque étape suivante</li>'
-             '<li>Demander quelle étape le client souhaite approfondir</li>'
-             '<li>Noter les demandes d\'ajustement pour la prochaine séance</li>'
-             '</ul></div>')
+             + "".join(f"<li>{escape(p)}</li>" for p in POUR_CONCLURE)
+             + "</ul></div>")
     P.append(f'<footer>Guide généré le {datetime.now().strftime("%d/%m/%Y à %H:%M")} '
              "à partir des opérations réellement effectuées dans la base.</footer>")
     P.append("</div></body></html>")

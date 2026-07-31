@@ -7,7 +7,9 @@ Claude Desktop, Cursor...**
 - **Aucun identifiant stocké** : l'assistant demande l'URL, le login et la clé API dans la
   conversation (`odoo_connect`) — ils ne vivent qu'en mémoire, le temps de la session.
 - **Écriture bloquée par défaut** : elle s'active par un outil dédié (`odoo_enable_write`),
-  que l'assistant ne doit appeler qu'après accord explicite de l'utilisateur.
+  que l'assistant ne doit appeler qu'après accord explicite de l'utilisateur. Tant qu'elle
+  n'est pas activée, seules les méthodes de **lecture** d'Odoo sont autorisées (liste
+  blanche) — y compris via l'appel brut `odoo_execute`.
 - **Modifications de masse prévisualisées** : `odoo_update_where` montre d'abord combien
   d'enregistrements sont visés, avec un échantillon avant/après, et n'écrit qu'après
   confirmation.
@@ -17,7 +19,9 @@ Claude Desktop, Cursor...**
   de dupliquer.
 - **Tout est tracé** : chaque écriture est journalisée automatiquement avec son état
   avant/après, et `odoo_journal_report` produit un rapport d'intervention présentable
-  au client — ce qui a été fait, et pourquoi.
+  au client — ce qui a été fait, et pourquoi. Les secrets (mots de passe, IBAN, clés)
+  sont masqués et les binaires résumés avant stockage ; le journal est lisible par le
+  seul utilisateur (droits `0600`).
 - **Tableaux de bord générés** : `odoo_dashboard_create` produit de vrais tableaux de bord
   Odoo dont les graphiques sont recalculés en direct, pas des captures d'écran.
 - **Maquettes de démonstration sûres** : un questionnaire de qualification cadre l'avant-vente,
@@ -117,14 +121,14 @@ de test) :
 | `odoo_update_where` | Modification de masse sur un domaine, **prévisualisée** avant application |
 | `odoo_unlink` | Suppression définitive (confirmation exigée au-delà de 50) |
 | `odoo_upsert` | Créer-ou-mettre-à-jour par External ID |
-| `odoo_execute` | Appel brut `execute_kw` (même garde-fou sur les méthodes d'écriture) |
+| `odoo_execute` | Appel brut `execute_kw` (liste blanche de méthodes de lecture tant que l'écriture n'est pas activée) |
 
 ### Fichiers
 
 | Outil | Rôle |
 |---|---|
 | `odoo_import_file` | Importer un .xlsx/.csv — modes `inspect`, `check`, `run` |
-| `odoo_export_file` | Exporter une recherche vers .xlsx ou .csv |
+| `odoo_export_file` | Exporter une recherche vers .xlsx ou .csv (`ecraser=True` pour remplacer un fichier existant) |
 | `odoo_get_attachment` | Télécharger une pièce jointe (PDF de facture, document...) |
 
 ### Démonstration et avant-vente
@@ -133,7 +137,7 @@ de test) :
 |---|---|
 | `odoo_demo_questionnaire` | Questionnaire de qualification à faire remplir avant une démo |
 | `odoo_demo_mode` | Filet de sécurité : neutralise toute adresse e-mail écrite |
-| `odoo_demo_check` | Audite la base et corrige les adresses réelles restantes |
+| `odoo_demo_check` | Audite contacts, employés, pistes et utilisateurs — et corrige les adresses réelles restantes |
 
 ### Tableaux de bord
 
@@ -277,11 +281,16 @@ Une fois activé, **toute** adresse écrite est réécrite vers `example.com` �
 réservé par la RFC 2606, qui ne peut appartenir à personne. La garantie est posée au seul
 endroit par lequel passent toutes les écritures, elle tient donc quel que soit l'outil
 utilisé : création, modification, upsert, import de fichier, ou même appel brut
-`odoo_execute`. La partie gauche de l'adresse est conservée, donc `jean.dupont@example.com`
-reste lisible à l'écran pendant la démonstration.
+`odoo_execute`. Elle couvre aussi les lignes imbriquées (commandes one2many/many2many)
+et les duplications (`copy`), et **chaque** adresse d'un champ multi-destinataires est
+vérifiée, pas seulement la dernière. Le domaine de remplacement n'est pas paramétrable :
+seuls les domaines réservés (`example.com` & co.) sont acceptés. La partie gauche de
+l'adresse est conservée, donc `jean.dupont@example.com` reste lisible à l'écran pendant
+la démonstration.
 
 `odoo_demo_check` balaie une base reprise de quelqu'un d'autre et signale — ou corrige —
-les adresses qui pourraient encore recevoir du courrier.
+les adresses qui pourraient encore recevoir du courrier : contacts, employés, pistes
+(`crm.lead`) et utilisateurs.
 
 ## Générer un tableau de bord
 
@@ -326,7 +335,8 @@ longue.
 **Il dépose l'intégralité sur disque.** Quand un résultat dépasse le plafond, le jeu
 complet est écrit dans `~/odoo-mcp-resultats/` et le chemin est renvoyé. L'assistant le
 relit avec son propre outil de lecture, sans repasser par Odoo : quelques dizaines de
-tokens au lieu de dizaines de milliers.
+tokens au lieu de dizaines de milliers. Ces fichiers sont purgés automatiquement
+(au-delà de 7 jours ou de 50 fichiers).
 
 **Il se resserre à mesure que la session avance.**
 

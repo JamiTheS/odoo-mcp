@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 from pathlib import Path
 
 from odoo_mcp.odoo_client import OdooError
@@ -16,18 +17,28 @@ def read_rows(path: Path, sheet: str = "", header_row: int = 1) -> tuple[list[st
         except ImportError as exc:  # openpyxl est dans les dépendances, mais au cas où
             raise OdooError("openpyxl manquant — réinstalle le serveur.") from exc
         wb = load_workbook(path, data_only=True, read_only=True)
-        ws = wb[sheet] if sheet else wb.worksheets[0]
-        it = ws.iter_rows(values_only=True)
-        header: list[str] = []
-        for _ in range(header_row):
-            row = next(it, None)
-            if row is None:
-                raise OdooError(f"{path.name} : ligne d'en-tête {header_row} introuvable.")
-            header = [str(h).strip() if h is not None else "" for h in row]
-        rows = [list(r) for r in it
-                if any(v is not None and str(v).strip() != "" for v in r)]
-        wb.close()
-        return header, rows
+        try:
+            if sheet:
+                try:
+                    ws = wb[sheet]
+                except KeyError:
+                    raise OdooError(
+                        f"{path.name} : onglet '{sheet}' introuvable "
+                        f"(disponibles : {', '.join(wb.sheetnames)}).")
+            else:
+                ws = wb.worksheets[0]
+            it = ws.iter_rows(values_only=True)
+            header: list[str] = []
+            for _ in range(header_row):
+                row = next(it, None)
+                if row is None:
+                    raise OdooError(f"{path.name} : ligne d'en-tête {header_row} introuvable.")
+                header = [str(h).strip() if h is not None else "" for h in row]
+            rows = [list(r) for r in it
+                    if any(v is not None and str(v).strip() != "" for v in r)]
+            return header, rows
+        finally:
+            wb.close()
 
     if path.suffix.lower() == ".csv":
         for enc in ("utf-8-sig", "cp1252", "latin-1"):
@@ -42,7 +53,11 @@ def read_rows(path: Path, sheet: str = "", header_row: int = 1) -> tuple[list[st
                     reader = csv.reader(fh, dialect)
                     header = []
                     for _ in range(header_row):
-                        header = [h.strip() for h in next(reader)]
+                        try:
+                            header = [h.strip() for h in next(reader)]
+                        except StopIteration:
+                            raise OdooError(
+                                f"{path.name} : ligne d'en-tête {header_row} introuvable.")
                     rows = [r for r in reader if any(str(v).strip() for v in r)]
                 return header, rows
             except UnicodeDecodeError:
@@ -70,15 +85,15 @@ def inspect_summary(header: list[str], rows: list[list]) -> dict:
         cols.append(col)
 
     summary: dict = {"lignes": len(rows), "colonnes": cols}
-    for key in ("id", "ID", "External ID", "Code"):
-        if key in header:
-            i = header.index(key)
-            ids = [str(r[i]) for r in rows if i < len(r) and r[i] not in (None, "")]
-            summary["identifiants"] = {
-                "colonne": key, "uniques": len(set(ids)),
-                "doublons": len(ids) - len(set(ids)),
-            }
-            break
+    cibles = {"id", "external id", "identifiant", "code"}
+    key = next((h for h in header if h.strip().lower() in cibles), None)
+    if key is not None:
+        i = header.index(key)
+        ids = [str(r[i]) for r in rows if i < len(r) and r[i] not in (None, "")]
+        summary["identifiants"] = {
+            "colonne": key, "uniques": len(set(ids)),
+            "doublons": len(ids) - len(set(ids)),
+        }
     return summary
 
 
@@ -104,6 +119,12 @@ def build(header: list[str], rows: list[list],
         for field, i in zip(fields, sources):
             v = r[i] if i < len(r) else None
             v = "" if v is None else v
+            if isinstance(v, datetime):
+                # openpyxl rend les dates en datetime ; load() veut le format Odoo.
+                if (v.hour, v.minute, v.second, v.microsecond) == (0, 0, 0, 0):
+                    v = v.strftime("%Y-%m-%d")
+                else:
+                    v = v.strftime("%Y-%m-%d %H:%M:%S")
             if isinstance(v, float) and v.is_integer():
                 v = int(v)
             v = str(v).strip()
@@ -119,9 +140,12 @@ def build(header: list[str], rows: list[list],
 def flatten(value):
     """Aplati une valeur Odoo pour l'export : many2one → libellé, x2many → cardinalité."""
     if isinstance(value, (list, tuple)):
-        if len(value) == 2 and isinstance(value[0], int):
-            return value[1]
-        return ", ".join(str(v) for v in value) if len(value) <= 6 else f"[{len(value)}]"
+        if (len(value) == 2 and isinstance(value[0], int)
+                and isinstance(value[1], str)):
+            return value[1]                     # many2one [id, libellé]
+        if all(isinstance(v, int) for v in value):
+            return f"[{len(value)}]"            # x2many : des ids bruts ne disent rien
+        return ", ".join(str(v) for v in value)
     if value is False:
         return ""
     return value

@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import uuid
+
+from odoo_mcp.odoo_client import OdooError
 
 # Types de graphiques exposés, avec leur libellé courant.
 TYPES = {
@@ -29,8 +32,40 @@ TYPES = {
 # Granularités acceptées derrière un champ date : "date_order:month"
 GRANULARITES = {"day", "week", "month", "quarter", "year"}
 
-LARGEUR_COLONNE = 96      # o-spreadsheet : largeur par défaut d'une colonne
-HAUTEUR_LIGNE = 23
+# Version du schéma o-spreadsheet à écrire dans le classeur, par version majeure
+# d'Odoo. La clé "version" pilote les migrations au chargement : une valeur
+# inconnue du serveur fait perdre des clés ou afficher des titres « [object
+# Object] » ; une valeur plus ancienne est simplement migrée à l'ouverture.
+# Sources :
+#   - odoo/o-spreadsheet, src/migrations/data.ts, constante CURRENT_VERSION
+#     (branche 16.0 → 12.5, branche 17.0 → 14.5 ; numérotation en chaîne de
+#     type « 18.5.10 » ensuite) ;
+#   - odoo/odoo, addons/spreadsheet/static/src/o_spreadsheet/migration.js
+#     (16.0 → ODOO_VERSION 5, 17.0 → 6, 18.0 → 12) ;
+#   - odoo/odoo master (19), étapes « 18.5.10 » → « 19.x » : un classeur en
+#     « 18.5.10 » y est migré à l'ouverture — Odoo livre d'ailleurs ses propres
+#     tableaux de bord de démo à cette version (addons/spreadsheet_dashboard_*/
+#     data/files/*.json, branche master).
+SCHEMAS = {
+    16: {"version": 12.5, "odooVersion": 5},
+    17: {"version": 14.5, "odooVersion": 6},
+    # 18 et 19 partagent le schéma « 18.5.10 » (Odoo 19 migre à l'ouverture).
+    18: {"version": "18.5.10"},
+    19: {"version": "18.5.10"},
+}
+SCHEMA_DEFAUT = SCHEMAS[18]
+
+# Clés absentes du schéma avant Odoo 18 (vérifié sur les classeurs de démo
+# livrés par Odoo 16 et 17) : omises plutôt qu'ignorées. `title` y est aussi
+# une chaîne, pas un objet.
+CLES_FIGURE_APRES_17 = ("dataSets", "humanize", "cumulatedStart", "fillArea",
+                        "chartId", "fieldMatching")
+
+
+def _majeur_odoo(version_odoo) -> int | None:
+    """Extrait le numéro majeur ('18.0+e', 'saas~17.2' → 18, 17) ; None sinon."""
+    m = re.search(r"\d+", str(version_odoo or ""))
+    return int(m.group()) if m else None
 
 
 def _figure(titre: str, model: str, groupby: list[str], mesure: str, mode: str,
@@ -78,12 +113,16 @@ def _figure(titre: str, model: str, groupby: list[str], mesure: str, mode: str,
     }
 
 
-def valider(client, graphiques: list[dict]) -> list[str]:
+def valider(client, graphiques: list[dict], cache: dict | None = None) -> list[str]:
     """Vérifie modèles, champs de regroupement et mesures AVANT d'écrire.
 
     Un tableau de bord qui référence un champ inexistant s'ouvre vide, sans message
     d'erreur : mieux vaut refuser tout de suite et dire lequel pose problème.
+    `cache` mémorise les fields_get par modèle — 5 graphiques sur le même modèle
+    ne doivent pas coûter 5 appels RPC identiques.
     """
+    if cache is None:
+        cache = {}
     problemes = []
     for i, g in enumerate(graphiques, 1):
         titre = g.get("titre") or f"graphique {i}"
@@ -96,8 +135,11 @@ def valider(client, graphiques: list[dict]) -> list[str]:
             problemes.append(f"{titre} : type '{mode}' inconnu "
                              f"(attendu {', '.join(TYPES)})")
         try:
-            champs = client.fields_get(model)
-        except Exception:
+            if model not in cache:
+                cache[model] = client.fields_get(model)
+            champs = cache[model]
+        except OdooError:
+            # Erreur métier (modèle absent, droits) — les erreurs réseau remontent.
             problemes.append(f"{titre} : modèle '{model}' introuvable")
             continue
 
@@ -126,11 +168,19 @@ def valider(client, graphiques: list[dict]) -> list[str]:
     return problemes
 
 
-def construire(titre: str, graphiques: list[dict], sous_titre: str = "") -> dict:
+def construire(titre: str, graphiques: list[dict], sous_titre: str = "",
+               version_odoo=None) -> dict:
     """Assemble le classeur o-spreadsheet complet, en disposant les graphiques.
 
     Disposition : deux graphiques par ligne, sauf ceux marqués `pleine_largeur`.
+
+    `version_odoo` (ex. "17.0", ou entier) adapte le schéma du classeur à la
+    version du serveur cible ; sans elle, le schéma Odoo 18/19 est émis.
     """
+    majeur = _majeur_odoo(version_odoo)
+    schema = SCHEMAS.get(majeur, SCHEMA_DEFAUT)
+    avant_18 = majeur is not None and majeur < 18
+
     figures = []
     col, row = 0, 3
     hauteur_bloc = 16
@@ -159,15 +209,24 @@ def construire(titre: str, graphiques: list[dict], sous_titre: str = "") -> dict
         else:
             col, row = 0, row + hauteur_bloc
 
+    if avant_18:
+        for f in figures:
+            d = f["data"]
+            for cle in CLES_FIGURE_APRES_17:
+                d.pop(cle, None)
+            d["title"] = d["title"]["text"]
+            d["metaData"].pop("mode", None)
+            d["metaData"].pop("cumulatedStart", None)
+
     lignes_utiles = row + hauteur_bloc + 4
-    cellules = {"A1": f'=_t("{titre}")'}
+    cellules = {"A1": _formule_titre(titre)}
     styles_cellules = {"A1": 1}
     if sous_titre:
-        cellules["A2"] = f'=_t("{sous_titre}")'
+        cellules["A2"] = _formule_titre(sous_titre)
         styles_cellules["A2"] = 2
 
-    return {
-        "version": "18.5.10",
+    classeur = {
+        "version": schema["version"],
         "sheets": [{
             "id": "Sheet1",
             "name": "Tableau de bord",
@@ -197,10 +256,24 @@ def construire(titre: str, graphiques: list[dict], sous_titre: str = "") -> dict
         "globalFilters": [], "customTableStyles": {},
         "chartOdooMenusReferences": {},
     }
+    if "odooVersion" in schema:
+        classeur["odooVersion"] = schema["odooVersion"]
+    if avant_18:
+        del classeur["customTableStyles"]
+        if majeur < 17:
+            del classeur["settings"]  # locale absente d'Odoo 16
+    return classeur
+
+
+def _formule_titre(texte: str) -> str:
+    """Formule _t("…") sûre : guillemets doublés, retours à la ligne supprimés."""
+    propre = " ".join(str(texte).split())
+    return '=_t("' + propre.replace('"', '""') + '")'
 
 
 def encoder(classeur: dict) -> str:
-    return base64.b64encode(json.dumps(classeur).encode("utf-8")).decode("ascii")
+    return base64.b64encode(
+        json.dumps(classeur, ensure_ascii=False).encode("utf-8")).decode("ascii")
 
 
 def decoder(valeur) -> dict:

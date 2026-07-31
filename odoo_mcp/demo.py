@@ -27,20 +27,26 @@ DOMAINES_SURS = {"example.com", "example.net", "example.org", "example.edu",
 
 # Champs qui contiennent une adresse selon les modèles Odoo.
 CHAMPS_EMAIL = {
-    "email", "email_from", "email_cc", "email_bcc", "email_normalized",
+    "email", "email_from", "email_to", "email_cc", "email_bcc", "email_normalized",
     "partner_email", "work_email", "private_email", "email_formatted",
     "reply_to", "invoice_user_email", "catchall_email",
+    "secondary_email", "signup_email",
 }
 
 _ADRESSE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 
 def domaine_sur(adresse: str, domaine: str = DOMAINE_SUR) -> bool:
-    """L'adresse pointe-t-elle vers un domaine qui ne peut recevoir aucun courriel ?"""
+    """Sûre seulement si TOUTES les adresses présentes sont sur un domaine réservé.
+
+    « paul@client.fr, jean@example.com » mélange une adresse réelle et une adresse
+    réservée : ne tester que la dernière laisserait passer la première. Une valeur
+    sans aucune adresse reste sûre.
+    """
     if not adresse or "@" not in adresse:
         return True
-    hote = adresse.rsplit("@", 1)[-1].strip().lower().rstrip(">").strip()
-    return hote == domaine.lower() or hote in DOMAINES_SURS
+    surs = DOMAINES_SURS | {domaine.lower()}
+    return all(a.rsplit("@", 1)[-1].lower() in surs for a in _ADRESSE.findall(adresse))
 
 
 def neutraliser(adresse: str, domaine: str = DOMAINE_SUR) -> str:
@@ -64,12 +70,29 @@ def neutraliser(adresse: str, domaine: str = DOMAINE_SUR) -> str:
 
 
 def assainir_valeurs(valeurs: dict, domaine: str = DOMAINE_SUR) -> tuple[dict, int]:
-    """Neutralise les adresses d'un dictionnaire de valeurs (create / write)."""
+    """Neutralise les adresses d'un dictionnaire de valeurs (create / write).
+
+    Descend aussi dans les commandes x2many : les vals de (0, 0, vals) et
+    (1, id, vals) sont assainies récursivement ; (6, 0, ids) ne porte rien à assainir.
+    """
     if not isinstance(valeurs, dict):
         return valeurs, 0
     modifies = 0
     sortie = dict(valeurs)
     for champ, valeur in valeurs.items():
+        if isinstance(valeur, list) and any(
+                isinstance(c, (list, tuple)) and len(c) == 3 and c[0] in (0, 1)
+                for c in valeur):
+            commandes = []
+            for c in valeur:
+                if isinstance(c, (list, tuple)) and len(c) == 3 and c[0] in (0, 1):
+                    vals, n = assainir_valeurs(c[2], domaine)
+                    modifies += n
+                    commandes.append([c[0], c[1], vals])
+                else:
+                    commandes.append(c)   # (6, 0, ids) etc. : rien à assainir
+            sortie[champ] = commandes
+            continue
         if champ not in CHAMPS_EMAIL or not isinstance(valeur, str):
             continue
         if domaine_sur(valeur, domaine):
